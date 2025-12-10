@@ -12,5 +12,6 @@ build/
 .pytest_cache/
 .coverage
 htmlcov/
+query_log.jsonl
 venv/
 query_log.jsonl
