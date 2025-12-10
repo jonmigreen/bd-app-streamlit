@@ -13,3 +13,4 @@ build/
 .coverage
 htmlcov/
 venv/
+query_log.jsonl
