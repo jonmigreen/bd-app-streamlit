@@ -14,4 +14,3 @@ build/
 htmlcov/
 query_log.jsonl
 venv/
-query_log.jsonl
