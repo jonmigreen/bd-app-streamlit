@@ -1,5 +1,4 @@
 """Main Streamlit application for OpenAI chat with vector store RAG."""
-import sys
 import os
 from typing import List, Dict
 
@@ -60,6 +59,9 @@ if "research_mode" not in st.session_state:
 
 if "research_results" not in st.session_state:
     st.session_state.research_results = []
+
+if "relevance_threshold" not in st.session_state:
+    st.session_state.relevance_threshold = 0.55  # Default: middle of 0.5-0.6 range
 
 if "selected_snippets" not in st.session_state:
     st.session_state.selected_snippets = []  # List of selected snippet indices
@@ -168,6 +170,18 @@ with st.sidebar:
     
     st.divider()
     
+    # Relevance threshold control
+    st.session_state.relevance_threshold = st.slider(
+        "📊 Min Relevance Score",
+        min_value=0.0,
+        max_value=1.0,
+        value=st.session_state.relevance_threshold,
+        step=0.05,
+        help="Filter out sources with relevance scores below this threshold. Sources without scores are always kept."
+    )
+    
+    st.divider()
+    
     if st.button("🗑️ Clear Chat History", type="secondary", use_container_width=True):
         st.session_state.messages = []
         st.session_state.message_sources = {}
@@ -205,12 +219,20 @@ if st.session_state.research_mode:
                     try:
                         st.session_state.research_results = st.session_state.openai_client.search_vectors(
                             query=research_query,
-                            top_k=10,
-                            filters=research_filters if any(research_filters.values()) else None
+                            top_k=50,
+                            filters=research_filters if any(research_filters.values()) else None,
+                            min_relevance_score=st.session_state.relevance_threshold
                         )
                     except Exception as e:
                         st.error(f"Search failed: {str(e)}")
                         st.session_state.research_results = []
+                    
+                    # Debug logging for filtered sources
+                    if st.session_state.research_results and st.session_state.debug_mode:
+                        if st.session_state.research_results and '_debug' in st.session_state.research_results[0]:
+                            filtered_count = st.session_state.research_results[0].get('_debug', {}).get('filtered_count', 0)
+                            if filtered_count > 0:
+                                st.info(f"🔍 Filtered out {filtered_count} source(s) below relevance threshold ({st.session_state.relevance_threshold:.2f})")
             else:
                 st.warning("Please enter a search query")
         
@@ -325,10 +347,11 @@ if st.session_state.research_mode:
 # Two-column layout for chat mode
 if not st.session_state.research_mode:
     col1, col2 = st.columns([2, 1])
+    # col1 and col2 are both defined above and used in separate with blocks below
     
     with col1:
         # Left column: Chat interface
-        st.subheader("💬 Chat")
+        st.subheader("")
         
         # Display chat history
         for idx, message in enumerate(st.session_state.messages):
@@ -357,26 +380,37 @@ if not st.session_state.research_mode:
                         # Call 1: Get RAG-enhanced response with sources
                         response_text, sources = st.session_state.openai_client.get_rag_response(
                             user_query=prompt,
-                            conversation_history=conversation_history
+                            conversation_history=conversation_history,
+                            min_relevance_score=st.session_state.relevance_threshold
                         )
+                        
+                        # Debug logging for filtered sources in RAG response
+                        if st.session_state.debug_mode and st.session_state.openai_client.last_filtered_count > 0:
+                            st.info(f"🔍 Filtered out {st.session_state.openai_client.last_filtered_count} source(s) below relevance threshold ({st.session_state.relevance_threshold:.2f}) in RAG response")
                         
                         # Call 2: Get detailed sources using direct vector search (in parallel)
                         search_results = []
                         try:
                             search_results = st.session_state.openai_client.search_vectors(
                                 query=prompt,
-                                top_k=10,
-                                filters=st.session_state.filters if any(st.session_state.filters.values()) else None
+                                top_k=50,
+                                filters=st.session_state.filters if any(st.session_state.filters.values()) else None,
+                                min_relevance_score=st.session_state.relevance_threshold
                             )
                             if search_results:
                                 st.session_state.current_sources = search_results
+                                # Debug logging for filtered sources
+                                if st.session_state.debug_mode and search_results and '_debug' in search_results[0]:
+                                    filtered_count = search_results[0].get('_debug', {}).get('filtered_count', 0)
+                                    if filtered_count > 0:
+                                        st.info(f"🔍 Filtered out {filtered_count} source(s) below relevance threshold ({st.session_state.relevance_threshold:.2f})")
                             else:
                                 # Empty results - try fallback
                                 if st.session_state.debug_mode:
                                     st.warning("Direct vector search returned empty results, trying fallback...")
                                 try:
                                     fallback_sources = st.session_state.openai_client.get_sources_for_query(
-                                        prompt, max_results=10
+                                        prompt, max_results=50, min_relevance_score=st.session_state.relevance_threshold
                                     )
                                     if fallback_sources:
                                         st.session_state.current_sources = fallback_sources
@@ -396,7 +430,7 @@ if not st.session_state.research_mode:
                             # Try fallback: use get_sources_for_query which might work
                             try:
                                 fallback_sources = st.session_state.openai_client.get_sources_for_query(
-                                    prompt, max_results=10
+                                    prompt, max_results=50, min_relevance_score=st.session_state.relevance_threshold
                                 )
                                 if fallback_sources:
                                     st.session_state.current_sources = fallback_sources
@@ -565,7 +599,7 @@ if not st.session_state.research_mode:
                                     # Display summary in left column (add to messages)
                                     st.session_state.messages.append({
                                         "role": "user",
-                                        "content": f"[Summarize selected snippets from sources]"
+                                        "content": "[Summarize selected snippets from sources]"
                                     })
                                     st.session_state.messages.append({
                                         "role": "assistant",

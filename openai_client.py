@@ -15,8 +15,36 @@ class OpenAIClient:
         self.vector_store_id = Config.OPENAI_VECTOR_STORE_ID
         self.model = Config.OPENAI_MODEL
         self.temperature = Config.OPENAI_TEMPERATURE
+        self.last_filtered_count = 0
     
-    def search_vectors(self, query: str, top_k: int = 10, filters: Optional[Dict] = None) -> List[Dict]:
+    def _filter_by_relevance(self, sources: List[Dict], min_score: float) -> tuple[List[Dict], int]:
+        """
+        Filter sources by relevance score.
+        
+        Args:
+            sources: List of source dictionaries with optional 'score' field
+            min_score: Minimum relevance score threshold
+            
+        Returns:
+            Tuple of (filtered_sources, filtered_count)
+            - Sources with score >= min_score are kept
+            - Sources with score is None are kept (fallback cases)
+            - Sources with score < min_score are filtered out
+        """
+        filtered = []
+        filtered_count = 0
+        
+        for source in sources:
+            score = source.get('score')
+            # Keep sources with no score (fallback) or score above threshold
+            if score is None or score >= min_score:
+                filtered.append(source)
+            else:
+                filtered_count += 1
+        
+        return filtered, filtered_count
+    
+    def search_vectors(self, query: str, top_k: int = 50, filters: Optional[Dict] = None, min_relevance_score: Optional[float] = None) -> List[Dict]:
         """
         Simple helper function to search vector store and return formatted results.
         
@@ -25,8 +53,9 @@ class OpenAIClient:
         
         Args:
             query: The search query string
-            top_k: Number of results to return (default: 10)
+            top_k: Number of results to return (default: 50)
             filters: Optional metadata filters dict (e.g., {"client": "DCC", "year": "2024"})
+            min_relevance_score: Optional minimum relevance score threshold for filtering
             
         Returns:
             List of results: [{"filename": "...", "snippet": "...", "score": 0.89, "metadata": {...}}]
@@ -112,11 +141,22 @@ class OpenAIClient:
                             break
                 if match:
                     filtered.append(item)
-            return filtered
+            formatted = filtered
+        
+        # Apply relevance filtering if threshold provided
+        if min_relevance_score is not None:
+            formatted, filtered_count = self._filter_by_relevance(formatted, min_relevance_score)
+            # Store filtered count in result metadata for debug logging
+            if filtered_count > 0:
+                # Add debug info to first result if not present
+                if formatted and '_debug' not in formatted[0]:
+                    formatted[0]['_debug'] = {}
+                if formatted:
+                    formatted[0]['_debug']['filtered_count'] = filtered_count
         
         return formatted
     
-    def direct_vector_search(self, query: str, max_num_results: int = 10) -> List[Dict]:
+    def direct_vector_search(self, query: str, max_num_results: int = 50) -> List[Dict]:
         """
         Directly search the vector store using the search API endpoint.
         
@@ -126,7 +166,7 @@ class OpenAIClient:
         
         Args:
             query: The search query string
-            max_num_results: Maximum number of results to return (default: 10)
+            max_num_results: Maximum number of results to return (default: 50)
             
         Returns:
             List of search results with content, metadata, and scores
@@ -242,7 +282,7 @@ class OpenAIClient:
             else:
                 raise Exception(f"Vector store search failed: {error_msg}")
     
-    def _vector_search_via_rest_api(self, query: str, max_num_results: int = 10) -> List[Dict]:
+    def _vector_search_via_rest_api(self, query: str, max_num_results: int = 50) -> List[Dict]:
         """
         Fallback method: Search vector store using REST API directly.
         Used when SDK method is not available.
@@ -340,7 +380,7 @@ class OpenAIClient:
                 f"Ensure your vector store ID '{self.vector_store_id}' is correct and contains indexed files."
             )
     
-    def query_vector_store(self, query: str, top_k: int = 5) -> List[Dict]:
+    def query_vector_store(self, query: str, top_k: int = 50) -> List[Dict]:
         """
         Query the OpenAI vector store for relevant context.
         
@@ -521,7 +561,7 @@ class OpenAIClient:
             else:
                 raise Exception(f"Chat completion failed: {error_msg}")
     
-    def get_rag_response(self, user_query: str, conversation_history: List[Dict[str, str]]) -> tuple[str, List[Dict]]:
+    def get_rag_response(self, user_query: str, conversation_history: List[Dict[str, str]], min_relevance_score: Optional[float] = None) -> tuple[str, List[Dict]]:
         """
         Get RAG-enhanced response by querying vector store and generating chat completion.
         Also extracts source file IDs from the Assistants API response.
@@ -529,6 +569,7 @@ class OpenAIClient:
         Args:
             user_query: The user's question or message
             conversation_history: Previous messages in the conversation
+            min_relevance_score: Optional minimum relevance score threshold for filtering
             
         Returns:
             Tuple of (response_text, sources_list) where sources_list contains:
@@ -536,6 +577,13 @@ class OpenAIClient:
         """
         # Step 1: Query vector store for relevant context using Assistants API
         vector_results = self.query_vector_store(user_query)
+        
+        # Filter by relevance score if threshold provided
+        if min_relevance_score is not None:
+            vector_results, filtered_count = self._filter_by_relevance(vector_results, min_relevance_score)
+            self.last_filtered_count = filtered_count
+        else:
+            self.last_filtered_count = 0
         
         # Step 2: Extract source file IDs from vector store results
         source_file_ids = []
@@ -596,7 +644,7 @@ class OpenAIClient:
         else:
             raise Exception("No response generated from chat completion")
     
-    def get_sources_for_query(self, query: str, max_results: int = 10) -> List[Dict]:
+    def get_sources_for_query(self, query: str, max_results: int = 50, min_relevance_score: Optional[float] = None) -> List[Dict]:
         """
         Get source documents for a query using direct vector store search.
         Formats results for clean display (hides technical details).
@@ -604,6 +652,7 @@ class OpenAIClient:
         Args:
             query: The search query string
             max_results: Maximum number of results to return
+            min_relevance_score: Optional minimum relevance score threshold for filtering
             
         Returns:
             List of formatted source documents:
@@ -637,6 +686,15 @@ class OpenAIClient:
                 }
             }
             formatted_results.append(formatted)
+        
+        # Apply relevance filtering if threshold provided
+        if min_relevance_score is not None:
+            formatted_results, filtered_count = self._filter_by_relevance(formatted_results, min_relevance_score)
+            # Store filtered count in debug info
+            if filtered_count > 0 and formatted_results:
+                if '_debug' not in formatted_results[0]:
+                    formatted_results[0]['_debug'] = {}
+                formatted_results[0]['_debug']['filtered_count'] = filtered_count
         
         return formatted_results
 
