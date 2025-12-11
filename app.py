@@ -10,6 +10,7 @@ from openai_client import OpenAIClient
 from config import Config
 from logger import api_error_logger
 
+from utility import check_password
 # Page configuration
 st.set_page_config(
     page_title="OpenAI Chat with RAG",
@@ -17,6 +18,9 @@ st.set_page_config(
     layout="wide"
 )
 
+# Do not continue if check_password is not True.  
+if not check_password():  
+    st.stop()
 # Initialize session state
 def init_session_state():
     """Initialize all session state variables."""
@@ -170,7 +174,7 @@ def about_page():
 
     ### 🔍 Research Mode
 
-    Search the database directlyusing keywords, phrases, or sentences. Relevant snippets are returned. 
+    Search the database directly using keywords, phrases, or sentences. Relevant snippets are returned. 
     You can then select snippets to use as context for a follow-up question.
   
     ---

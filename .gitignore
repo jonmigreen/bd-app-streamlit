@@ -19,3 +19,5 @@ vectorStoreHelper.py
 CitationDocs/
 query_log.jsonl
 api_errors.log
+.streamlit/
+.streamlit/secrets.toml
