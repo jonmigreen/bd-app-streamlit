@@ -522,6 +522,80 @@ class OpenAIClient:
             else:
                 raise Exception(f"Chat completion failed: {error_msg}")
     
+    def ask_about_chunks(
+        self,
+        question: str,
+        chunks: List[Dict]
+    ) -> Tuple[str, List[Dict]]:
+        """
+        Ask a question about selected document chunks.
+        
+        Args:
+            question: The user's question about the chunks
+            chunks: List of chunk dicts with 'filename', 'content'/'snippet', and optionally 'score'
+            
+        Returns:
+            Tuple of (answer_text, cited_sources) where cited_sources contains
+            the chunks that were referenced in the answer
+        """
+        if not chunks:
+            raise ValueError("No chunks provided to analyze")
+        
+        # Build context from chunks with numbered references
+        context_parts = []
+        for i, chunk in enumerate(chunks, 1):
+            filename = chunk.get('filename', f'Document {i}')
+            content = chunk.get('content') or chunk.get('snippet', '')
+            context_parts.append(f"[Source {i}: {filename}]\n{content}")
+        
+        context = "\n\n---\n\n".join(context_parts)
+        
+        # System prompt requiring citations
+        system_prompt = """You are a helpful research assistant. Answer the user's question based ONLY on the provided source documents.
+
+Rules:
+1. Only use information from the provided sources
+2. Cite your sources using [Source N] format when making claims
+3. If the sources don't contain enough information to answer, say so
+4. Be concise but thorough
+
+Sources:
+""" + context
+        
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question}
+        ]
+        
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=self.temperature
+            )
+            
+            if not response.choices:
+                raise Exception("No response generated")
+            
+            answer = response.choices[0].message.content
+            
+            # Identify which sources were cited in the response
+            cited_sources = []
+            for i, chunk in enumerate(chunks, 1):
+                if f"[Source {i}]" in answer or f"Source {i}" in answer:
+                    cited_sources.append(chunk)
+            
+            # If no explicit citations found, include all as potential sources
+            if not cited_sources:
+                cited_sources = chunks
+            
+            return answer, cited_sources
+            
+        except Exception as e:
+            error_msg = str(e)
+            api_error_logger.error(f"Ask about chunks failed: {error_msg}")
+            raise Exception(f"Failed to analyze chunks: {error_msg}")
+    
     def get_rag_response(
         self, 
         user_query: str, 

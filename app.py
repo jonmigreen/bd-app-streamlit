@@ -29,6 +29,8 @@ def init_session_state():
         "selected_snippets": [],
         "filters": {},
         "current_sources": [],
+        "research_answer": None,  # Research mode answer
+        "research_cited_sources": [],  # Research mode cited sources
     }
     
     for key, default in defaults.items():
@@ -100,7 +102,7 @@ with st.sidebar:
     page_options = {
         "about": "💡 About",
         "chat": "💬 Chat with BD Knowledge Base",
-        "vector_search": "🔍 Vector Search"
+        "vector_search": "🔬 Research Mode"
     }
     
     selected_page = st.radio(
@@ -170,7 +172,7 @@ if st.session_state.current_page == "about":
     ## Business Development Resource Library
     
     This application provides intelligent access to your business development knowledge base 
-    using advanced AI and vector search technology.
+    using advanced AI and vector search technology. Note citations/snippets are chunks
     
     ### Features
     
@@ -181,13 +183,16 @@ if st.session_state.current_page == "about":
     3. The AI generates a response using the retrieved context
     4. Sources are displayed so you can verify the information
     
-    #### Vector Search
-    Search the database directly for documents without AI generation.
-    Returns the most relevant document chunks for your query.
+    #### Research Mode
+    Search, select, and analyze specific document snippets:
+    1. Enter a search query to find relevant document chunks
+    2. Review results and select the snippets you want to analyze
+    3. Ask a custom question about your selected snippets
+    4. Get an AI-generated answer with citations to the specific sources used
     
     ### How to Use
     - **Chat Page**: Type questions and receive AI-generated answers with sources
-    - **Vector Search Page**: Enter queries to explore documents directly
+    - **Research Mode**: Search documents, select snippets, and ask targeted questions
     - **Settings**: Configure debug mode and relevance thresholds
     """)
 
@@ -261,8 +266,8 @@ elif st.session_state.current_page == "chat":
                     st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
 elif st.session_state.current_page == "vector_search":
-    st.title("Vector Search")
-    st.markdown("Search the database directly for documents.")
+    st.title("Research Mode")
+    st.markdown("Search documents, select relevant snippets, and ask questions about them.")
     st.divider()
     
     col1, col2 = st.columns([1, 2])
@@ -283,6 +288,8 @@ elif st.session_state.current_page == "vector_search":
                             min_relevance_score=st.session_state.relevance_threshold
                         )
                         st.session_state.selected_snippets = []
+                        st.session_state.research_answer = None
+                        st.session_state.research_cited_sources = []
                     except Exception as e:
                         api_error_logger.error(f"Search failed: {str(e)}")
                         st.error(f"Search failed: {str(e)}")
@@ -290,39 +297,66 @@ elif st.session_state.current_page == "vector_search":
             else:
                 st.warning("Please enter a search query")
         
-        # Summarize selected
+        # Research Mode: Ask about selected chunks
         if st.session_state.selected_snippets and st.session_state.research_results:
             st.divider()
-            st.subheader("📝 Summary")
+            st.subheader("💡 Research Mode")
+            st.caption(f"{len(st.session_state.selected_snippets)} snippet(s) selected")
             
-            if st.button("Summarize Selected", type="secondary", use_container_width=True):
-                selected = [
-                    st.session_state.research_results[i]
-                    for i in st.session_state.selected_snippets
-                    if i < len(st.session_state.research_results)
-                ]
-                
-                if selected:
-                    context = "\n\n---\n\n".join([
-                        f"From {s.get('filename', 'Document')}:\n{s.get('snippet', '')}"
-                        for s in selected
-                    ])
-                    
-                    messages = [
-                        {"role": "system", "content": "Summarize the provided document snippets."},
-                        {"role": "user", "content": f"Please summarize:\n\n{context}"}
+            # Question input
+            research_question = st.text_area(
+                "Ask a question about the selected snippets:",
+                placeholder="e.g., What are the key themes across these documents?",
+                height=100,
+                key="research_question"
+            )
+            
+            if st.button("🔎 Analyze Selected", type="primary", use_container_width=True):
+                if research_question.strip():
+                    selected = [
+                        st.session_state.research_results[i]
+                        for i in st.session_state.selected_snippets
+                        if i < len(st.session_state.research_results)
                     ]
                     
-                    with st.spinner("Generating summary..."):
-                        try:
-                            response = st.session_state.openai_client.get_chat_completion(
-                                messages=messages, context=None, stream=False
-                            )
-                            if response.choices:
-                                st.markdown(response.choices[0].message.content)
-                        except Exception as e:
-                            api_error_logger.error(f"Summary failed: {str(e)}")
-                            st.error(f"Failed to summarize: {str(e)}")
+                    if selected:
+                        with st.spinner("Analyzing selected snippets..."):
+                            try:
+                                answer, cited_sources = st.session_state.openai_client.ask_about_chunks(
+                                    question=research_question,
+                                    chunks=selected
+                                )
+                                
+                                # Store results in session state for display
+                                st.session_state.research_answer = answer
+                                st.session_state.research_cited_sources = cited_sources
+                                
+                            except Exception as e:
+                                api_error_logger.error(f"Research query failed: {str(e)}")
+                                st.error(f"Failed to analyze: {str(e)}")
+                else:
+                    st.warning("Please enter a question")
+            
+            # Display research answer if available
+            if "research_answer" in st.session_state and st.session_state.research_answer:
+                st.divider()
+                st.markdown("### Answer")
+                st.markdown(st.session_state.research_answer)
+                
+                # Show cited sources
+                if "research_cited_sources" in st.session_state and st.session_state.research_cited_sources:
+                    with st.expander(f"📚 Sources Referenced ({len(st.session_state.research_cited_sources)})", expanded=False):
+                        for i, src in enumerate(st.session_state.research_cited_sources, 1):
+                            filename = src.get('filename', f'Document {i}')
+                            display_name = filename.split('/')[-1] if '/' in filename else filename
+                            score = src.get('score')
+                            
+                            st.markdown(f"**{i}. {display_name}**")
+                            if score is not None:
+                                st.caption(f"Relevance: {score:.3f}")
+                            
+                            if i < len(st.session_state.research_cited_sources):
+                                st.divider()
     
     with col2:
         st.subheader("📚 Search Results")
