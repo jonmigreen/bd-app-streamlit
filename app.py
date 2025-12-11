@@ -1,4 +1,5 @@
 """Main Streamlit application for OpenAI chat with vector store RAG."""
+
 import json
 from datetime import datetime
 from typing import List, Dict
@@ -31,11 +32,11 @@ def init_session_state():
         "research_answer": None,  # Research mode answer
         "research_cited_sources": [],  # Research mode cited sources
     }
-    
+
     for key, default in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = default
-    
+
     # Initialize OpenAI client
     if "openai_client" not in st.session_state:
         try:
@@ -43,6 +44,7 @@ def init_session_state():
         except ValueError as e:
             st.error(f"Configuration Error: {str(e)}")
             st.stop()
+
 
 init_session_state()
 
@@ -53,42 +55,48 @@ def render_sidebar():
         # Settings
         with st.expander("⚙️ Settings", expanded=False):
             st.info(f"**Model:** {Config.OPENAI_MODEL}")
-            
+
             if st.session_state.debug_mode:
                 vs_id = Config.OPENAI_VECTOR_STORE_ID or "Not configured"
                 st.info(f"**Vector Store ID:** `{vs_id}`")
-                
+
                 client = st.session_state.openai_client
-                api_status = "✅ Responses API" if client.responses_api_available else "❌ Direct Search Only"
+                api_status = (
+                    "✅ Responses API"
+                    if client.responses_api_available
+                    else "❌ Direct Search Only"
+                )
                 st.info(f"**API Mode:** {api_status}")
-                
+
                 if client.last_api_used:
                     st.caption(f"**Last Used:** `{client.last_api_used}`")
             else:
                 st.info("Vector store configured ✓")
-            
+
             st.divider()
-            
+
             st.session_state.debug_mode = st.checkbox(
                 "🐛 Debug Mode",
                 value=st.session_state.debug_mode,
-                help="Show technical details"
+                help="Show technical details",
             )
-            
+
             st.divider()
-            
+
             st.session_state.relevance_threshold = st.slider(
                 "📊 Min Relevance Score",
                 min_value=0.0,
                 max_value=1.0,
                 value=st.session_state.relevance_threshold,
                 step=0.05,
-                help="Filter sources below this threshold"
+                help="Filter sources below this threshold",
             )
-            
+
             st.divider()
-            
-            if st.button("🗑️ Clear Chat History", type="secondary", use_container_width=True):
+
+            if st.button(
+                "🗑️ Clear Chat History", type="secondary", use_container_width=True
+            ):
                 st.session_state.messages = []
                 st.session_state.message_sources = {}
                 st.session_state.research_results = []
@@ -101,25 +109,25 @@ def display_source_expander(sources: List[Dict], title_prefix: str = ""):
     """Display sources with expandable full passages."""
     if not sources:
         return
-    
+
     with st.expander(f"📚 Sources ({len(sources)})", expanded=False):
         for num, source in enumerate(sources, 1):
-            filename = source.get('filename', f'Document {num}')
-            display_name = filename.split('/')[-1] if '/' in filename else filename
-            
+            filename = source.get("filename", f"Document {num}")
+            display_name = filename.split("/")[-1] if "/" in filename else filename
+
             st.markdown(f"**{num}. {display_name}**")
-            
+
             # Expandable full passage (from file_search results)
-            full_content = source.get('content', '')
+            full_content = source.get("content", "")
             if full_content:
                 with st.expander("📖 Expand to see full passage", expanded=False):
                     st.markdown(full_content)
-            
+
             # Show relevance score if available
-            score = source.get('score')
+            score = source.get("score")
             if score is not None:
                 st.caption(f"Relevance: {score:.3f}")
-            
+
             if num < len(sources):
                 st.divider()
 
@@ -132,12 +140,12 @@ def log_query(question: str, answer: str, sources: List[Dict], filters: Dict):
             "question": question,
             "answer": answer,
             "top_sources": [
-                {"filename": src.get('filename', 'Unknown'), "score": src.get('score')}
+                {"filename": src.get("filename", "Unknown"), "score": src.get("score")}
                 for src in sources[:5]
             ],
-            "filters": filters
+            "filters": filters,
         }
-        
+
         with open("query_log.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(log_entry) + "\n")
     except Exception:
@@ -150,121 +158,169 @@ def about_page():
     render_sidebar()
     st.title("About")
     st.markdown("""
-    ## Business Development Resource Library
     
-    This application provides intelligent access to your business development knowledge base 
-    using advanced AI and vector search technology. Note citations/snippets are chunks
+    This application provides intelligent access to Civilian's business development documents. It searches our documents, pulls relevant snippets, and uses them as context for AI generated answers with citations.
     
-    ### Features
+    ---
+    ## ⭐ How it Works
+
+    ### 💬 Chat
+
+    Ask questions in natural language and get AI-generated answers using relevant BD documents as context.
+
+    ### 🔍 Research Mode
+
+    Search the database directlyusing keywords, phrases, or sentences. Relevant snippets are returned. 
+    You can then select snippets to use as context for a follow-up question.
+  
+    ---
+
+    ## Example Questions:
+
+        - How does Civilian approach behavior-change based on marketing? 
+        - Pull three examples where we describe behavior change models.  
+        - How do we talk about co-creation with community-based organizations?
+        - Summarize common challenges we cite in our proposals.
+        - Summarize Civilian's approach to campaign development.
+        - Describe Civilian's approach to paid media management.
+        - Find all references to subcontractor management across the dataset and summarize the specific process Civilian utilizes.
+        - Retrieve and cite each RFP and page number where we discuss our co-creation process in detail.
+        - Find, summarize, and cite all references to the use of translation and transadaptation services.
+    ---
+    ## Data & Limitations
     
-    #### Chat with BD Knowledge Base
-    Ask questions in natural language and get comprehensive answers backed by your documents:
-    1. Your question is processed and searched against the vector store
-    2. Relevant document chunks are retrieved using semantic search
-    3. The AI generates a response using the retrieved context
-    4. Sources are displayed so you can verify the information
-    
-    #### Research Mode
-    Search, select, and analyze specific document snippets:
-    1. Enter a search query to find relevant document chunks
-    2. Review results and select the snippets you want to analyze
-    3. Ask a custom question about your selected snippets
-    4. Get an AI-generated answer with citations to the specific sources used
-    
-    ### How to Use
-    - **Chat Page**: Type questions and receive AI-generated answers with sources
-    - **Research Mode**: Search documents, select snippets, and ask targeted questions
-    - **Settings**: Configure debug mode and relevance thresholds
-    """)
+    - The BD Assistant can only use documents that have been loaded into the database. It currently contains ~20 RFP response documents.  
+    - If an answer does **not** include citations, treat it as a suggestion and verify manually.  
+    - Some documents may have limited or imperfect text extraction.  
+    - This is a **pilot**: quality will improve as we add more documents, refine prompts, and adjust search settings.
+    ---
+
+    ## Feedback
+    This is an early pilot. Please tell us:
+    - Where answers were especially helpful
+    - Where answers were wrong, incomplete, or confusing
+    - Gaps you noticed in the document set (e.g., “we need the final X RFP in here”)
+    ---
+    """
+    )
 
 
 def chat_page():
     """Chat page content."""
     render_sidebar()
     st.title("Chat with BD Knowledge Base")
-    st.markdown("Ask questions and get answers enhanced with context from your vector store.")
-    
+    st.markdown(
+        """
+        **Ask questions and get answers enhanced with context from your vector store.**
+        1. You ask a question.
+        2. The system searches our BD document library and pulls the most relevant passages.
+        3. The AI reads those passages and drafts an answer using that content.
+        4. It shows the answer along with citations and snippets so you can verify and reuse the language.
+        ---
+        """
+    )
+
     # Display chat history
     for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
-            
+
             # Display sources for assistant messages
-            if message["role"] == "assistant" and idx in st.session_state.message_sources:
+            if (
+                message["role"] == "assistant"
+                and idx in st.session_state.message_sources
+            ):
                 sources = st.session_state.message_sources[idx]
                 display_source_expander(sources)
-    
+
     # Chat input
     if prompt := st.chat_input("Type your message here..."):
         # Add user message
         st.session_state.messages.append({"role": "user", "content": prompt})
-        
+
         with st.chat_message("user"):
             st.markdown(prompt)
-        
+
         # Generate response
         with st.chat_message("assistant"):
             message_placeholder = st.empty()
             sources_placeholder = st.empty()
-            
+
             with st.spinner("Querying vector store and generating response..."):
                 try:
                     conversation_history = st.session_state.messages[:-1]
-                    
-                    response_text, sources = st.session_state.openai_client.get_rag_response(
-                        user_query=prompt,
-                        conversation_history=conversation_history,
-                        min_relevance_score=st.session_state.relevance_threshold
+
+                    response_text, sources = (
+                        st.session_state.openai_client.get_rag_response(
+                            user_query=prompt,
+                            conversation_history=conversation_history,
+                            min_relevance_score=st.session_state.relevance_threshold,
+                        )
                     )
-                    
+
                     # Debug info
                     client = st.session_state.openai_client
                     if st.session_state.debug_mode and client.last_filtered_count > 0:
-                        st.info(f"🔍 Filtered {client.last_filtered_count} source(s) below threshold")
-                    
+                        st.info(
+                            f"🔍 Filtered {client.last_filtered_count} source(s) below threshold"
+                        )
+
                     # Display response
                     message_placeholder.markdown(response_text)
-                    
+
                     # Display sources
                     with sources_placeholder.container():
                         display_source_expander(sources)
-                    
+
                     # Log query
                     log_query(prompt, response_text, sources, st.session_state.filters)
-                    
+
                     # Store message and sources
                     message_idx = len(st.session_state.messages)
                     st.session_state.message_sources[message_idx] = sources
-                    st.session_state.messages.append({"role": "assistant", "content": response_text})
-                    
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": response_text}
+                    )
+
                 except ValueError as e:
                     error_msg = f"⚠️ Configuration Error: {str(e)}"
                     api_error_logger.error(f"Config error: {str(e)}")
                     message_placeholder.error(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                    
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": error_msg}
+                    )
+
                 except Exception as e:
                     error_msg = f"❌ Error: {str(e)}"
                     api_error_logger.error(f"API error: {str(e)}")
                     message_placeholder.error(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": error_msg}
+                    )
 
 
 def research_page():
     """Research Mode page content."""
     render_sidebar()
     st.title("Research Mode")
-    st.markdown("Search documents, select relevant snippets, and ask questions about them.")
+    st.markdown("""
+        **Search documents, select relevant snippets, and ask questions about them.**
+        1. Enter a search query to find relevant document chunks.
+        2. Review the results and select the snippets you want to work with.
+        3. Ask a follow-up question about your selected snippets.
+        4. The AI Assistant will generate an answer using **only** those selected snippets and return citations.
+        """
+    )
     st.divider()
-    
+
     col1, col2 = st.columns([1, 2])
-    
+
     with col1:
         st.subheader("🔍 Search")
-        
+
         # Search
         query = st.text_input("Search query:", placeholder="e.g., fiscal management")
-        
+
         if st.button("🔍 Search", type="primary", use_container_width=True):
             if query:
                 with st.spinner("Searching..."):
@@ -272,7 +328,7 @@ def research_page():
                         st.session_state.research_results = st.session_state.openai_client.search_vectors(
                             query=query,
                             top_k=50,
-                            min_relevance_score=st.session_state.relevance_threshold
+                            min_relevance_score=st.session_state.relevance_threshold,
                         )
                         st.session_state.selected_snippets = []
                         st.session_state.research_answer = None
@@ -283,147 +339,171 @@ def research_page():
                         st.session_state.research_results = []
             else:
                 st.warning("Please enter a search query")
-        
+
         # Research Mode: Ask about selected chunks
         if st.session_state.selected_snippets and st.session_state.research_results:
             st.divider()
             st.subheader("💡 Research Mode")
             st.caption(f"{len(st.session_state.selected_snippets)} snippet(s) selected")
-            
+
             # Question input
             research_question = st.text_area(
                 "Ask a question about the selected snippets:",
                 placeholder="e.g., What are the key themes across these documents?",
                 height=100,
-                key="research_question"
+                key="research_question",
             )
-            
-            if st.button("🔎 Analyze Selected", type="primary", use_container_width=True):
+
+            if st.button(
+                "🔎 Analyze Selected", type="primary", use_container_width=True
+            ):
                 if research_question.strip():
                     selected = [
                         st.session_state.research_results[i]
                         for i in st.session_state.selected_snippets
                         if i < len(st.session_state.research_results)
                     ]
-                    
+
                     if selected:
                         with st.spinner("Analyzing selected snippets..."):
                             try:
-                                answer, cited_sources = st.session_state.openai_client.ask_about_chunks(
-                                    question=research_question,
-                                    chunks=selected
+                                answer, cited_sources = (
+                                    st.session_state.openai_client.ask_about_chunks(
+                                        question=research_question, chunks=selected
+                                    )
                                 )
-                                
+
                                 # Store results in session state for display
                                 st.session_state.research_answer = answer
                                 st.session_state.research_cited_sources = cited_sources
-                                
+
                             except Exception as e:
-                                api_error_logger.error(f"Research query failed: {str(e)}")
+                                api_error_logger.error(
+                                    f"Research query failed: {str(e)}"
+                                )
                                 st.error(f"Failed to analyze: {str(e)}")
                 else:
                     st.warning("Please enter a question")
-            
+
             # Display research answer if available
-            if "research_answer" in st.session_state and st.session_state.research_answer:
+            if (
+                "research_answer" in st.session_state
+                and st.session_state.research_answer
+            ):
                 st.divider()
                 st.markdown("### Answer")
                 st.markdown(st.session_state.research_answer)
-                
+
                 # Show cited sources
-                if "research_cited_sources" in st.session_state and st.session_state.research_cited_sources:
-                    with st.expander(f"📚 Sources Referenced ({len(st.session_state.research_cited_sources)})", expanded=False):
-                        for i, src in enumerate(st.session_state.research_cited_sources, 1):
-                            filename = src.get('filename', f'Document {i}')
-                            display_name = filename.split('/')[-1] if '/' in filename else filename
-                            score = src.get('score')
-                            
+                if (
+                    "research_cited_sources" in st.session_state
+                    and st.session_state.research_cited_sources
+                ):
+                    with st.expander(
+                        f"📚 Sources Referenced ({len(st.session_state.research_cited_sources)})",
+                        expanded=False,
+                    ):
+                        for i, src in enumerate(
+                            st.session_state.research_cited_sources, 1
+                        ):
+                            filename = src.get("filename", f"Document {i}")
+                            display_name = (
+                                filename.split("/")[-1] if "/" in filename else filename
+                            )
+                            score = src.get("score")
+
                             st.markdown(f"**{i}. {display_name}**")
                             if score is not None:
                                 st.caption(f"Relevance: {score:.3f}")
-                            
+
                             if i < len(st.session_state.research_cited_sources):
                                 st.divider()
-    
+
     with col2:
         st.subheader("📚 Search Results")
-        
+
         results = st.session_state.research_results
-        
+
         if results:
             st.success(f"✅ Found {len(results)} result(s)")
             st.divider()
-            
+
             # Group by filename
             by_file = {}
             for idx, result in enumerate(results):
-                filename = result.get('filename', f'Document {idx + 1}')
+                filename = result.get("filename", f"Document {idx + 1}")
                 if filename not in by_file:
                     by_file[filename] = []
                 by_file[filename].append((idx, result))
-            
+
             # Display grouped results
             for filename, items in by_file.items():
-                display_name = filename.split('/')[-1] if '/' in filename else filename
-                
-                with st.expander(f"📄 {display_name} ({len(items)} snippet(s))", expanded=False):
+                display_name = filename.split("/")[-1] if "/" in filename else filename
+
+                with st.expander(
+                    f"📄 {display_name} ({len(items)} snippet(s))", expanded=False
+                ):
                     for idx, result in items:
                         # Selection checkbox
                         selected = st.checkbox(
                             f"Select snippet {idx + 1}",
                             value=idx in st.session_state.selected_snippets,
-                            key=f"snippet_{idx}"
+                            key=f"snippet_{idx}",
                         )
-                        
+
                         if selected and idx not in st.session_state.selected_snippets:
                             st.session_state.selected_snippets.append(idx)
                         elif not selected and idx in st.session_state.selected_snippets:
                             st.session_state.selected_snippets.remove(idx)
-                        
+
                         # Display snippet
-                        snippet = result.get('snippet') or result.get('content', '')
+                        snippet = result.get("snippet") or result.get("content", "")
                         if snippet:
                             st.markdown(snippet)
-                        
+
                         # Show score
-                        score = result.get('score')
+                        score = result.get("score")
                         if score is not None:
                             st.caption(f"Relevance: {score:.3f}")
-                        
+
                         if idx < items[-1][0]:
                             st.divider()
-        
+
         elif query:
             st.info("No documents found. Try a different search query.")
         else:
             st.info("Enter a search query and click Search to explore documents.")
-    
+
     # Debug panel
     if st.session_state.debug_mode:
         with st.expander("🐛 Debug Information", expanded=False):
             st.subheader("Session State")
-            st.json({
-                "total_messages": len(st.session_state.messages),
-                "messages_with_sources": len(st.session_state.message_sources),
-                "research_results_count": len(st.session_state.research_results),
-                "vector_store_id": Config.OPENAI_VECTOR_STORE_ID,
-                "model": Config.OPENAI_MODEL
-            })
-            
+            st.json(
+                {
+                    "total_messages": len(st.session_state.messages),
+                    "messages_with_sources": len(st.session_state.message_sources),
+                    "research_results_count": len(st.session_state.research_results),
+                    "vector_store_id": Config.OPENAI_VECTOR_STORE_ID,
+                    "model": Config.OPENAI_MODEL,
+                }
+            )
+
             st.subheader("API Usage")
             client = st.session_state.openai_client
-            st.json({
-                "Responses API Available": client.responses_api_available,
-                "Last API Used": client.last_api_used or "None",
-                "Last Error": client.last_error or "None"
-            })
+            st.json(
+                {
+                    "Responses API Available": client.responses_api_available,
+                    "Last API Used": client.last_api_used or "None",
+                    "Last Error": client.last_error or "None",
+                }
+            )
 
 
 # Navigation setup
 pages = [
     st.Page(about_page, title="About", icon="💡"),
-    st.Page(chat_page, title="Chat with BD Knowledge Base", icon="💬"),
-    st.Page(research_page, title="Research Mode", icon="🔬"),
+    st.Page(chat_page, title="Chat", icon="💬"),
+    st.Page(research_page, title="Research Mode", icon="🔍"),
 ]
 
 nav = st.navigation(pages)

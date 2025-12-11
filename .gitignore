@@ -17,3 +17,5 @@ api_errors.log
 venv/
 vectorStoreHelper.py
 CitationDocs/
+query_log.jsonl
+api_errors.log
