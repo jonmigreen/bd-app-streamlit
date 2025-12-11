@@ -23,7 +23,6 @@ def init_session_state():
         "messages": [],
         "message_sources": {},  # Map message index to sources
         "debug_mode": False,
-        "current_page": "chat",
         "research_results": [],
         "relevance_threshold": 0.55,
         "selected_snippets": [],
@@ -46,6 +45,56 @@ def init_session_state():
             st.stop()
 
 init_session_state()
+
+
+def render_sidebar():
+    """Render sidebar settings that appear on all pages."""
+    with st.sidebar:
+        # Settings
+        with st.expander("⚙️ Settings", expanded=False):
+            st.info(f"**Model:** {Config.OPENAI_MODEL}")
+            
+            if st.session_state.debug_mode:
+                vs_id = Config.OPENAI_VECTOR_STORE_ID or "Not configured"
+                st.info(f"**Vector Store ID:** `{vs_id}`")
+                
+                client = st.session_state.openai_client
+                api_status = "✅ Responses API" if client.responses_api_available else "❌ Direct Search Only"
+                st.info(f"**API Mode:** {api_status}")
+                
+                if client.last_api_used:
+                    st.caption(f"**Last Used:** `{client.last_api_used}`")
+            else:
+                st.info("Vector store configured ✓")
+            
+            st.divider()
+            
+            st.session_state.debug_mode = st.checkbox(
+                "🐛 Debug Mode",
+                value=st.session_state.debug_mode,
+                help="Show technical details"
+            )
+            
+            st.divider()
+            
+            st.session_state.relevance_threshold = st.slider(
+                "📊 Min Relevance Score",
+                min_value=0.0,
+                max_value=1.0,
+                value=st.session_state.relevance_threshold,
+                step=0.05,
+                help="Filter sources below this threshold"
+            )
+            
+            st.divider()
+            
+            if st.button("🗑️ Clear Chat History", type="secondary", use_container_width=True):
+                st.session_state.messages = []
+                st.session_state.message_sources = {}
+                st.session_state.research_results = []
+                st.session_state.current_sources = []
+                st.session_state.selected_snippets = []
+                st.rerun()
 
 
 def display_source_expander(sources: List[Dict], title_prefix: str = ""):
@@ -95,78 +144,10 @@ def log_query(question: str, answer: str, sources: List[Dict], filters: Dict):
         pass  # Don't fail if logging fails
 
 
-# Sidebar
-with st.sidebar:
-    st.header("Navigation")
-    
-    page_options = {
-        "about": "💡 About",
-        "chat": "💬 Chat with BD Knowledge Base",
-        "vector_search": "🔬 Research Mode"
-    }
-    
-    selected_page = st.radio(
-        "Select Page",
-        options=list(page_options.keys()),
-        format_func=lambda x: page_options[x],
-        index=list(page_options.keys()).index(st.session_state.current_page)
-    )
-    
-    if selected_page != st.session_state.current_page:
-        st.session_state.current_page = selected_page
-        st.rerun()
-    
-    st.divider()
-    
-    # Settings
-    with st.expander("⚙️ Settings", expanded=False):
-        st.info(f"**Model:** {Config.OPENAI_MODEL}")
-        
-        if st.session_state.debug_mode:
-            vs_id = Config.OPENAI_VECTOR_STORE_ID or "Not configured"
-            st.info(f"**Vector Store ID:** `{vs_id}`")
-            
-            client = st.session_state.openai_client
-            api_status = "✅ Responses API" if client.responses_api_available else "❌ Direct Search Only"
-            st.info(f"**API Mode:** {api_status}")
-            
-            if client.last_api_used:
-                st.caption(f"**Last Used:** `{client.last_api_used}`")
-        else:
-            st.info("Vector store configured ✓")
-        
-        st.divider()
-        
-        st.session_state.debug_mode = st.checkbox(
-            "🐛 Debug Mode",
-            value=st.session_state.debug_mode,
-            help="Show technical details"
-        )
-        
-        st.divider()
-        
-        st.session_state.relevance_threshold = st.slider(
-            "📊 Min Relevance Score",
-            min_value=0.0,
-            max_value=1.0,
-            value=st.session_state.relevance_threshold,
-            step=0.05,
-            help="Filter sources below this threshold"
-        )
-        
-        st.divider()
-        
-        if st.button("🗑️ Clear Chat History", type="secondary", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.message_sources = {}
-            st.session_state.research_results = []
-            st.session_state.current_sources = []
-            st.session_state.selected_snippets = []
-            st.rerun()
-
-
-# Page routing
-if st.session_state.current_page == "about":
+# Page functions
+def about_page():
+    """About page content."""
+    render_sidebar()
     st.title("About")
     st.markdown("""
     ## Business Development Resource Library
@@ -196,7 +177,10 @@ if st.session_state.current_page == "about":
     - **Settings**: Configure debug mode and relevance thresholds
     """)
 
-elif st.session_state.current_page == "chat":
+
+def chat_page():
+    """Chat page content."""
+    render_sidebar()
     st.title("Chat with BD Knowledge Base")
     st.markdown("Ask questions and get answers enhanced with context from your vector store.")
     
@@ -265,7 +249,10 @@ elif st.session_state.current_page == "chat":
                     message_placeholder.error(error_msg)
                     st.session_state.messages.append({"role": "assistant", "content": error_msg})
 
-elif st.session_state.current_page == "vector_search":
+
+def research_page():
+    """Research Mode page content."""
+    render_sidebar()
     st.title("Research Mode")
     st.markdown("Search documents, select relevant snippets, and ask questions about them.")
     st.divider()
@@ -430,3 +417,14 @@ elif st.session_state.current_page == "vector_search":
                 "Last API Used": client.last_api_used or "None",
                 "Last Error": client.last_error or "None"
             })
+
+
+# Navigation setup
+pages = [
+    st.Page(about_page, title="About", icon="💡"),
+    st.Page(chat_page, title="Chat with BD Knowledge Base", icon="💬"),
+    st.Page(research_page, title="Research Mode", icon="🔬"),
+]
+
+nav = st.navigation(pages)
+nav.run()
