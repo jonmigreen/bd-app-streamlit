@@ -110,8 +110,8 @@ def format_response_with_citations(response_text: str, sources: List[Dict]) -> t
     if not citation_quotes:
         return response_text, {}
     
-    # Sort citations by start_index in reverse order (to insert from end)
-    citation_quotes.sort(key=lambda x: x['start_index'], reverse=True)
+    # Sort citations by start_index in ascending order
+    citation_quotes.sort(key=lambda x: x['start_index'], reverse=False)
     
     # Build citation mapping and insert markers
     formatted_text = response_text
