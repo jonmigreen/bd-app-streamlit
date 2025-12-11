@@ -94,7 +94,6 @@ class OpenAIClient:
         [{
             'file_id': str,
             'filename': str,
-            'quote': str,
             'start_index': int,
             'end_index': int
         }]
@@ -159,11 +158,9 @@ class OpenAIClient:
         if hasattr(annotation, 'file_citation'):
             citation = annotation.file_citation
             file_id = getattr(citation, 'file_id', None)
-            quote = getattr(citation, 'quote', None)
         # Check for direct file_id (flat structure)
         elif hasattr(annotation, 'file_id'):
             file_id = annotation.file_id
-            quote = getattr(annotation, 'quote', None)
         else:
             return None
         
@@ -173,10 +170,68 @@ class OpenAIClient:
         return {
             'file_id': file_id,
             'filename': self._get_filename(file_id),
-            'quote': quote or '',
             'start_index': getattr(annotation, 'start_index', None),
             'end_index': getattr(annotation, 'end_index', None)
         }
+    
+    def _extract_file_search_results(self, response) -> Dict[str, Dict]:
+        """
+        Extract file_search_call results from response output.
+        
+        Returns dict mapping file_id to {content, score, file_id, filename}.
+        When include=["file_search_call.results"] is used, the response contains
+        file_search_call items with full chunk content.
+        """
+        results_by_file_id: Dict[str, Dict] = {}
+        
+        if not hasattr(response, 'output') or not response.output:
+            return results_by_file_id
+        
+        for output_item in response.output:
+            # Look for file_search_call type items
+            item_type = getattr(output_item, 'type', None)
+            if item_type != 'file_search_call':
+                continue
+            
+            # Extract results from the file_search_call
+            results = getattr(output_item, 'results', None)
+            if not results:
+                continue
+            
+            for result in results:
+                file_id = getattr(result, 'file_id', None)
+                if not file_id:
+                    continue
+                
+                # Extract content - may be string or list of content blocks
+                content = ''
+                raw_content = getattr(result, 'content', None) or getattr(result, 'text', None)
+                
+                if isinstance(raw_content, list):
+                    # Content blocks format
+                    texts = []
+                    for block in raw_content:
+                        if hasattr(block, 'text'):
+                            texts.append(block.text)
+                        elif isinstance(block, dict) and 'text' in block:
+                            texts.append(block['text'])
+                    content = '\n\n'.join(texts)
+                elif isinstance(raw_content, str):
+                    content = raw_content
+                
+                score = getattr(result, 'score', None)
+                filename = getattr(result, 'filename', None) or self._get_filename(file_id)
+                
+                # Store by file_id (first occurrence wins, typically highest relevance)
+                if file_id not in results_by_file_id:
+                    results_by_file_id[file_id] = {
+                        'file_id': file_id,
+                        'content': content,
+                        'score': score,
+                        'filename': filename
+                    }
+        
+        return results_by_file_id
     
     def _clean_citation_markers(self, text: str, citations: List[Dict]) -> Tuple[str, Dict[str, int]]:
         """
@@ -510,7 +565,8 @@ class OpenAIClient:
         response = self.client.responses.create(
             model=self.model,
             input=user_query,
-            tools=[tools_config]
+            tools=[tools_config],
+            include=["file_search_call.results"]  # Get full chunk content
         )
         
         # Extract text and citations
@@ -519,10 +575,13 @@ class OpenAIClient:
         if not response_text:
             raise Exception("No response text generated")
         
+        # Extract file_search results (full chunk content with scores)
+        file_search_results = self._extract_file_search_results(response)
+        
         # Clean citation markers from text
         response_text, _ = self._clean_citation_markers(response_text, citations)
         
-        # Build sources from unique file_ids
+        # Build sources from unique file_ids, matching with file_search results
         sources = []
         seen_file_ids = set()
         
@@ -532,19 +591,24 @@ class OpenAIClient:
                 continue
             seen_file_ids.add(file_id)
             
-            # Get all quotes for this file
-            file_quotes = [c for c in citations if c.get('file_id') == file_id]
-            first_quote = file_quotes[0] if file_quotes else {}
+            # Get full content from file_search results
+            search_result = file_search_results.get(file_id, {})
+            full_content = search_result.get('content', '')
+            score = search_result.get('score')
+            filename = (
+                citation.get('filename') or 
+                search_result.get('filename') or 
+                self._get_filename(file_id)
+            )
             
             sources.append({
                 'file_id': file_id,
-                'filename': citation.get('filename', self._get_filename(file_id)),
-                'content': first_quote.get('quote', ''),
-                'snippet': first_quote.get('quote', ''),
-                'score': None,  # Responses API doesn't provide scores
+                'filename': filename,
+                'content': full_content,  # Full passage from file_search results
+                'snippet': full_content[:300] if full_content else '',  # For backward compat
+                'score': score,  # Relevance score from file_search results
                 'metadata': {
-                    'filename': citation.get('filename'),
-                    'citation_quotes': file_quotes
+                    'filename': filename
                 }
             })
         

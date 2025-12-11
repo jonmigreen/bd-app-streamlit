@@ -27,7 +27,7 @@ def init_session_state():
         "research_results": [],
         "relevance_threshold": 0.55,
         "selected_snippets": [],
-        "filters": {"client": None, "year": None, "topic": None},
+        "filters": {},
         "current_sources": [],
     }
     
@@ -47,7 +47,7 @@ init_session_state()
 
 
 def display_source_expander(sources: List[Dict], title_prefix: str = ""):
-    """Display sources in an expander with consistent formatting."""
+    """Display sources with expandable full passages."""
     if not sources:
         return
     
@@ -58,12 +58,11 @@ def display_source_expander(sources: List[Dict], title_prefix: str = ""):
             
             st.markdown(f"**{num}. {display_name}**")
             
-            # Show snippet/quote if available
-            snippet = source.get('snippet') or source.get('content', '')
-            if snippet:
-                max_len = 300
-                display_text = snippet[:max_len] + "..." if len(snippet) > max_len else snippet
-                st.markdown(display_text)
+            # Expandable full passage (from file_search results)
+            full_content = source.get('content', '')
+            if full_content:
+                with st.expander("📖 Expand to see full passage", expanded=False):
+                    st.markdown(full_content)
             
             # Show relevance score if available
             score = source.get('score')
@@ -269,16 +268,7 @@ elif st.session_state.current_page == "vector_search":
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        st.subheader("🔍 Search & Filters")
-        
-        # Filters
-        st.markdown("**Filters:**")
-        filters = {
-            "client": st.text_input("Client", value=st.session_state.filters.get("client") or ""),
-            "year": st.text_input("Year", value=st.session_state.filters.get("year") or ""),
-            "topic": st.text_input("Topic", value=st.session_state.filters.get("topic") or ""),
-        }
-        st.session_state.filters = filters
+        st.subheader("🔍 Search")
         
         # Search
         query = st.text_input("Search query:", placeholder="e.g., fiscal management")
@@ -287,11 +277,9 @@ elif st.session_state.current_page == "vector_search":
             if query:
                 with st.spinner("Searching..."):
                     try:
-                        active_filters = {k: v for k, v in filters.items() if v}
                         st.session_state.research_results = st.session_state.openai_client.search_vectors(
                             query=query,
                             top_k=50,
-                            filters=active_filters or None,
                             min_relevance_score=st.session_state.relevance_threshold
                         )
                         st.session_state.selected_snippets = []
