@@ -3,6 +3,7 @@ from typing import List, Dict, Optional
 from openai import OpenAI
 import requests
 from config import Config
+from logger import api_error_logger
 
 
 class OpenAIClient:
@@ -16,6 +17,30 @@ class OpenAIClient:
         self.model = Config.OPENAI_MODEL
         self.temperature = Config.OPENAI_TEMPERATURE
         self.last_filtered_count = 0
+        # Track Responses API availability and usage
+        try:
+            self.responses_api_available = hasattr(self.client, 'responses') and hasattr(self.client.responses, 'create')
+        except Exception:
+            self.responses_api_available = False
+        self.last_api_used = None  # Track which API was last used: "responses_api", "direct_vector_search", or "fallback_rag"
+        self.last_error = None  # Track last error message for debugging
+        self.responses_api_attempted = False  # Track if we attempted to use Responses API
+        self.conversation_id = None  # Track conversation ID for stateful Responses API calls
+    
+    def _ensure_conversation(self):
+        """Create a conversation if one doesn't exist for stateful Responses API calls."""
+        if not self.conversation_id:
+            try:
+                if hasattr(self.client, 'conversations') and hasattr(self.client.conversations, 'create'):
+                    convo = self.client.conversations.create()
+                    self.conversation_id = convo.id
+                else:
+                    # Conversations API not available
+                    return None
+            except Exception as e:
+                api_error_logger.error(f"Failed to create conversation: {str(e)}")
+                return None
+        return self.conversation_id
     
     def _filter_by_relevance(self, sources: List[Dict], min_score: float) -> tuple[List[Dict], int]:
         """
@@ -60,15 +85,18 @@ class OpenAIClient:
         Returns:
             List of results: [{"filename": "...", "snippet": "...", "score": 0.89, "metadata": {...}}]
         """
-        # Try direct search first, fallback to Assistants API method if not available
+        # Try direct search first, fallback to Responses API method if not available
         results_already_formatted = False
         try:
             results = self.direct_vector_search(query, max_num_results=top_k)
         except Exception as e:
-            # If direct search API is not available, use Assistants API method
-            error_msg = str(e).lower()
-            if "not available" in error_msg or "method" in error_msg or "attribute" in error_msg:
-                # Fallback to Assistants API approach
+            # If direct search API is not available, use Responses API method
+            error_msg = str(e)
+            api_error_logger.error(f"Direct vector search in search_vectors failed: {error_msg} | Query: {query[:100]}...")
+            error_msg_lower = error_msg.lower()
+            if "not available" in error_msg_lower or "method" in error_msg_lower or "attribute" in error_msg_lower:
+                # Fallback to Responses API approach
+                api_error_logger.error("Falling back to Responses API method")
                 raw_results = self.query_vector_store(query, top_k=top_k)
                 # Convert to search_vectors format
                 results = []
@@ -88,7 +116,7 @@ class OpenAIClient:
                             'filename': filename,
                             'snippet': content,  # Full snippet
                             'preview': preview,  # Short preview
-                            'score': None,  # Assistants API doesn't provide scores
+                            'score': None,  # Responses API doesn't provide scores in this context
                             'file_id': result.get('file_id'),
                             'metadata': result.get('metadata', {})
                         })
@@ -264,11 +292,16 @@ class OpenAIClient:
             return self._vector_search_via_rest_api(query, max_num_results)
         except Exception as e:
             error_msg = str(e)
+            # Log API error
+            api_error_logger.error(f"Direct vector search (SDK) failed: {error_msg} | Query: {query[:100]}...")
+            
             # If it's an attribute/method error, try REST API fallback
             if "method" in error_msg.lower() or "attribute" in error_msg.lower():
+                api_error_logger.error("Attempting REST API fallback...")
                 try:
                     return self._vector_search_via_rest_api(query, max_num_results)
                 except Exception as rest_error:
+                    api_error_logger.error(f"REST API fallback also failed: {str(rest_error)}")
                     raise Exception(
                         f"Vector store search failed via both SDK and REST API. "
                         f"SDK error: {error_msg}. REST API error: {str(rest_error)}"
@@ -375,137 +408,206 @@ class OpenAIClient:
             return results
             
         except requests.exceptions.RequestException as e:
+            error_msg = str(e)
+            api_error_logger.error(f"REST API vector store search failed: {error_msg} | Query: {query[:100]}...")
             raise Exception(
-                f"REST API vector store search failed: {str(e)}. "
+                f"REST API vector store search failed: {error_msg}. "
                 f"Ensure your vector store ID '{self.vector_store_id}' is correct and contains indexed files."
             )
     
     def query_vector_store(self, query: str, top_k: int = 50) -> List[Dict]:
         """
-        Query the OpenAI vector store for relevant context.
+        Query the OpenAI vector store using Responses API.
         
-        This method uses the Assistants API with file_search tool to retrieve
-        relevant context from the vector store. The vector store must be
-        associated with files that have been indexed.
+        Uses Responses API with file_search tool to retrieve relevant context.
+        Simpler and faster than Assistants API approach. Falls back to direct
+        vector search if Responses API is not available.
         
         Args:
             query: The search query string
-            top_k: Number of results to return (approximate, as Assistants API handles retrieval)
+            top_k: Number of results to return (approximate)
             
         Returns:
-            List of relevant document chunks with metadata
+            List of relevant document chunks with metadata and citations
         """
+        # Check if Responses API is available
+        if not hasattr(self.client, 'responses'):
+            # Responses API not available, fallback to direct vector search
+            self.last_api_used = "direct_vector_search"
+            return self.direct_vector_search(query, max_num_results=top_k)
+        
         try:
-            # Use Assistants API with file_search to query vector store
-            # Create a lightweight assistant for RAG queries
-            assistant = self.client.beta.assistants.create(
-                name="RAG Query Assistant",
+            # Use Responses API with file_search tool (following cookbook pattern)
+            self.last_api_used = "responses_api"
+            # Cookbook pattern: vector_store_ids in tools dict
+            tools_config = {
+                "type": "file_search",
+                "vector_store_ids": [self.vector_store_id],
+                "max_num_results": top_k
+            }
+            
+            response = self.client.responses.create(
                 model=self.model,
-                tools=[{"type": "file_search"}],
-                tool_resources={
-                    "file_search": {
-                        "vector_store_ids": [self.vector_store_id]
-                    }
-                },
-                instructions="You are a helpful assistant that retrieves relevant information from the knowledge base."
+                input=query,  # Use input for stateless queries (cookbook pattern)
+                tools=[tools_config]
             )
             
-            # Create a thread and add the query
-            thread = self.client.beta.threads.create(
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"Retrieve relevant information about: {query}"
-                    }
-                ]
-            )
-            
-            # Run the assistant
-            run = self.client.beta.threads.runs.create(
-                thread_id=thread.id,
-                assistant_id=assistant.id
-            )
-            
-            # Poll for completion
-            import time
-            max_wait = 30  # Maximum wait time in seconds
-            start_time = time.time()
-            
-            while run.status in ['queued', 'in_progress']:
-                if time.time() - start_time > max_wait:
-                    raise Exception("Vector store query timed out")
-                time.sleep(1)
-                run = self.client.beta.threads.runs.retrieve(
-                    thread_id=thread.id,
-                    run_id=run.id
-                )
-            
-            if run.status != 'completed':
-                raise Exception(f"Vector store query failed with status: {run.status}")
-            
-            # Retrieve the assistant's response with context
-            messages = self.client.beta.threads.messages.list(
-                thread_id=thread.id,
-                order="desc",
-                limit=1
-            )
-            
+            # Extract results from response following cookbook pattern
+            # Cookbook shows: response.output[1].content[0].annotations
             results = []
-            if messages.data:
-                assistant_message = messages.data[0]
-                for content_block in assistant_message.content:
-                    if content_block.type == 'text':
-                        text_value = content_block.text.value
-                        # Extract annotations for file citations
-                        annotations = getattr(content_block.text, 'annotations', [])
-                        file_ids = []
-                        file_info_map = {}  # Map file_id to filename
-                        
-                        for annotation in annotations:
-                            if hasattr(annotation, 'file_citation'):
-                                file_id = annotation.file_citation.file_id
-                                file_ids.append(file_id)
-                                
-                                # Try to fetch filename from file_id
-                                if file_id and file_id not in file_info_map:
-                                    try:
-                                        file_info = self.client.files.retrieve(file_id)
-                                        filename = getattr(file_info, 'filename', None) or getattr(file_info, 'name', None)
-                                        if filename:
-                                            file_info_map[file_id] = filename
-                                    except Exception:
-                                        # If file retrieval fails, use file_id as fallback
-                                        file_info_map[file_id] = f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"
-                        
-                        # Build metadata with filenames
-                        metadata = {}
-                        if file_ids:
-                            metadata['file_ids'] = file_ids
-                            # Add first filename if available (for display purposes)
-                            if file_ids and file_ids[0] in file_info_map:
-                                metadata['filename'] = file_info_map[file_ids[0]]
-                        
-                        results.append({
-                            'content': text_value,
-                            'metadata': metadata,
-                            'file_id': file_ids[0] if file_ids else None  # Store first file_id for compatibility
-                        })
+            file_info_map = {}
+            citation_quotes = []
+            text_content = ""
             
-            # Clean up assistant
-            try:
-                self.client.beta.assistants.delete(assistant.id)
-            except Exception:
-                pass
+            # Try cookbook pattern first: response.output
+            if hasattr(response, 'output') and response.output:
+                # Find the assistant message (usually output[1] after file_search call)
+                for output_item in response.output:
+                    if hasattr(output_item, 'content') and output_item.content:
+                        for content in output_item.content:
+                            # Extract text content
+                            if hasattr(content, 'text'):
+                                text_content = content.text
+                            elif hasattr(content, 'type') and content.type == 'text':
+                                if hasattr(content, 'text'):
+                                    text_content = content.text
+                                elif hasattr(content, 'value'):
+                                    text_content = content.value
+                            
+                            # Extract citations from annotations (cookbook pattern)
+                            annotations = None
+                            if hasattr(content, 'annotations'):
+                                annotations = content.annotations
+                            elif hasattr(output_item, 'annotations'):
+                                annotations = output_item.annotations
+                            
+                            if annotations:
+                                for annotation in annotations:
+                                    if hasattr(annotation, 'file_citation'):
+                                        citation = annotation.file_citation
+                                        file_id = getattr(citation, 'file_id', None)
+                                        
+                                        if file_id:
+                                            # Extract quote text if available
+                                            quote_text = getattr(citation, 'quote', None)
+                                            
+                                            # If quote is not directly available, try to extract from text using indices
+                                            if not quote_text:
+                                                start_idx = getattr(citation, 'start_index', None)
+                                                end_idx = getattr(citation, 'end_index', None)
+                                                if start_idx is not None and end_idx is not None and text_content:
+                                                    try:
+                                                        quote_text = text_content[start_idx:end_idx] if end_idx <= len(text_content) else None
+                                                    except Exception:
+                                                        quote_text = None
+                                            
+                                            # Fetch filename
+                                            if file_id not in file_info_map:
+                                                try:
+                                                    file_info = self.client.files.retrieve(file_id)
+                                                    filename = getattr(file_info, 'filename', None) or getattr(file_info, 'name', None)
+                                                    if filename:
+                                                        file_info_map[file_id] = filename
+                                                except Exception:
+                                                    file_info_map[file_id] = f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"
+                                            
+                                            citation_quotes.append({
+                                                'file_id': file_id,
+                                                'quote': quote_text or '',
+                                                'filename': file_info_map.get(file_id, f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"),
+                                                'start_index': start_idx,
+                                                'end_index': end_idx,
+                                                'has_quote': quote_text is not None
+                                            })
+            
+            # Fallback to items pattern if output pattern doesn't work
+            if not citation_quotes and hasattr(response, 'items') and response.items:
+                for item in response.items:
+                    if hasattr(item, 'type') and item.type == 'message':
+                        if hasattr(item, 'role') and item.role == 'assistant':
+                            # Extract text content
+                            if hasattr(item, 'content') and item.content:
+                                for content in item.content:
+                                    if hasattr(content, 'type') and content.type == 'text':
+                                        if hasattr(content, 'text'):
+                                            text_content = content.text
+                                        elif hasattr(content, 'value'):
+                                            text_content = content.value
+                                        
+                                        # Extract citations from annotations
+                                        if hasattr(content, 'annotations'):
+                                            annotations = content.annotations
+                                            for annotation in annotations:
+                                                if hasattr(annotation, 'file_citation'):
+                                                    citation = annotation.file_citation
+                                                    file_id = getattr(citation, 'file_id', None)
+                                                    
+                                                    if file_id:
+                                                        # Extract quote text if available
+                                                        quote_text = getattr(citation, 'quote', None)
+                                                        
+                                                        # If quote is not directly available, try to extract from text using indices
+                                                        if not quote_text:
+                                                            start_idx = getattr(citation, 'start_index', None)
+                                                            end_idx = getattr(citation, 'end_index', None)
+                                                            if start_idx is not None and end_idx is not None:
+                                                                try:
+                                                                    quote_text = text_content[start_idx:end_idx] if end_idx <= len(text_content) else None
+                                                                except Exception:
+                                                                    quote_text = None
+                                                        
+                                                        # Fetch filename
+                                                        if file_id not in file_info_map:
+                                                            try:
+                                                                file_info = self.client.files.retrieve(file_id)
+                                                                filename = getattr(file_info, 'filename', None) or getattr(file_info, 'name', None)
+                                                                if filename:
+                                                                    file_info_map[file_id] = filename
+                                                            except Exception:
+                                                                file_info_map[file_id] = f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"
+                                                        
+                                                        citation_quotes.append({
+                                                            'file_id': file_id,
+                                                            'quote': quote_text or '',
+                                                            'filename': file_info_map.get(file_id, f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"),
+                                                            'start_index': start_idx,
+                                                            'end_index': end_idx,
+                                                            'has_quote': quote_text is not None
+                                                        })
+            
+            if text_content or citation_quotes:
+                file_ids = [c['file_id'] for c in citation_quotes] if citation_quotes else []
+                results.append({
+                    'content': text_content,
+                    'metadata': {
+                        'file_ids': file_ids,
+                        'filename': citation_quotes[0]['filename'] if citation_quotes else None,
+                        'citation_quotes': citation_quotes
+                    },
+                    'file_id': file_ids[0] if file_ids else None,
+                    'citation_quotes': citation_quotes
+                })
             
             return results[:top_k] if results else []
             
+        except AttributeError:
+            # Responses API not available, fallback to direct vector search
+            self.last_api_used = "direct_vector_search"
+            return self.direct_vector_search(query, max_num_results=top_k)
         except Exception as e:
             error_msg = str(e)
-            if "vector_store" in error_msg.lower() or "vector store" in error_msg.lower():
+            # Log API error
+            api_error_logger.error(f"Responses API (query_vector_store) failed: {error_msg} | Query: {query[:100]}...")
+            
+            # Check if it's a Responses API availability issue
+            if "responses" in error_msg.lower() or "not available" in error_msg.lower() or "attribute" in error_msg.lower():
+                # Fallback to direct vector search if Responses API not available
+                api_error_logger.error("Falling back to direct vector search")
+                self.last_api_used = "direct_vector_search"
+                return self.direct_vector_search(query, max_num_results=top_k)
+            elif "vector_store" in error_msg.lower() or "vector store" in error_msg.lower():
                 raise Exception(f"Vector store query failed: {error_msg}. "
                               f"Ensure your vector store ID '{self.vector_store_id}' is correct and contains indexed files.")
-            elif "timeout" in error_msg.lower():
-                raise Exception("Vector store query timed out. The query took too long to process.")
             else:
                 raise Exception(f"Vector store query failed: {error_msg}")
     
@@ -554,17 +656,249 @@ class OpenAIClient:
             
         except Exception as e:
             error_msg = str(e)
+            api_error_logger.error(f"Chat completion failed: {error_msg}")
             if "api_key" in error_msg.lower() or "authentication" in error_msg.lower():
+                api_error_logger.error("Authentication error - check OPENAI_API_KEY")
                 raise ValueError(f"Authentication failed: {error_msg}. Please check your OPENAI_API_KEY.")
             elif "rate limit" in error_msg.lower() or "quota" in error_msg.lower():
+                api_error_logger.error("Rate limit exceeded")
                 raise Exception(f"Rate limit exceeded: {error_msg}. Please wait a moment and try again.")
             else:
                 raise Exception(f"Chat completion failed: {error_msg}")
     
     def get_rag_response(self, user_query: str, conversation_history: List[Dict[str, str]], min_relevance_score: Optional[float] = None) -> tuple[str, List[Dict]]:
         """
-        Get RAG-enhanced response by querying vector store and generating chat completion.
-        Also extracts source file IDs from the Assistants API response.
+        Get RAG-enhanced response using Responses API end-to-end.
+        Uses Responses API with file_search tool to retrieve context and generate response.
+        Extracts source file IDs and citation quotes from the Responses API response.
+        
+        Args:
+            user_query: The user's question or message
+            conversation_history: Previous messages in the conversation
+            min_relevance_score: Optional minimum relevance score threshold (not used with Responses API, kept for compatibility)
+            
+        Returns:
+            Tuple of (response_text, sources_list) where sources_list contains:
+            [{"file_id": "...", "snippet": "...", "content": "...", "filename": "...", "metadata": {...}}]
+            - snippet/content: Targeted citation quote (exact text used by model) when available
+            - metadata['is_citation_quote']: True if this is a targeted citation quote
+        """
+        # Check if Responses API is available
+        if not self.responses_api_available:
+            # Fallback: Use direct vector search + Chat Completions
+            self.last_api_used = "fallback_rag"
+            self.responses_api_attempted = False
+            return self._get_rag_response_fallback(user_query, conversation_history, min_relevance_score)
+        
+        try:
+            # Use Responses API end-to-end with file_search tool
+            self.last_api_used = "responses_api"
+            self.responses_api_attempted = True
+            self.last_error = None  # Clear previous error
+            
+            # Follow cookbook pattern: vector_store_ids in tools dict, use conversation for stateful calls
+            tools_config = {
+                "type": "file_search",
+                "vector_store_ids": [self.vector_store_id],
+                "max_num_results": 50  # Limit retrieval to avoid token limits
+            }
+            
+            # Use conversation parameter for stateful conversations (like the example)
+            conversation_id = self._ensure_conversation()
+            
+            if conversation_id:
+                # Use stateful conversation - only pass current user message
+                response = self.client.responses.create(
+                    model=self.model,
+                    conversation=conversation_id,
+                    input=[{"role": "user", "content": user_query}],
+                    tools=[tools_config]
+                )
+            else:
+                # Fallback: use input as string for stateless queries
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=user_query,
+                    tools=[tools_config]
+                )
+            
+            # Extract response text and citations following cookbook pattern
+            # Try simple output_text attribute first (like the example)
+            response_text = ""
+            citation_quotes = []
+            file_info_map = {}
+            unique_file_ids = set()
+            
+            # Try simple output_text attribute first (like the example)
+            if hasattr(response, 'output_text') and response.output_text:
+                response_text = response.output_text
+            # Fallback to cookbook pattern: response.output[1].content[0].annotations
+            elif hasattr(response, 'output') and response.output:
+                # Find the assistant message (usually output[1] after file_search call)
+                for output_item in response.output:
+                    if hasattr(output_item, 'content') and output_item.content:
+                        for content in output_item.content:
+                            # Extract text content
+                            if hasattr(content, 'text'):
+                                response_text = content.text
+                            elif hasattr(content, 'type') and content.type == 'text':
+                                if hasattr(content, 'text'):
+                                    response_text = content.text
+                                elif hasattr(content, 'value'):
+                                    response_text = content.value
+                            
+                            # Extract citations from annotations (cookbook pattern)
+                            annotations = None
+                            if hasattr(content, 'annotations'):
+                                annotations = content.annotations
+                            elif hasattr(output_item, 'annotations'):
+                                annotations = output_item.annotations
+                            
+                            if annotations:
+                                for annotation in annotations:
+                                    if hasattr(annotation, 'file_citation'):
+                                        citation = annotation.file_citation
+                                        file_id = getattr(citation, 'file_id', None)
+                                        
+                                        if file_id:
+                                            unique_file_ids.add(file_id)
+                                            
+                                            # Extract quote text if available
+                                            quote_text = getattr(citation, 'quote', None)
+                                            
+                                            # If quote is not directly available, try to extract from text using indices
+                                            if not quote_text:
+                                                start_idx = getattr(citation, 'start_index', None)
+                                                end_idx = getattr(citation, 'end_index', None)
+                                                if start_idx is not None and end_idx is not None and response_text:
+                                                    try:
+                                                        quote_text = response_text[start_idx:end_idx] if end_idx <= len(response_text) else None
+                                                    except Exception:
+                                                        quote_text = None
+                                            
+                                            # Fetch filename
+                                            if file_id not in file_info_map:
+                                                try:
+                                                    file_info = self.client.files.retrieve(file_id)
+                                                    filename = getattr(file_info, 'filename', None) or getattr(file_info, 'name', None)
+                                                    if filename:
+                                                        file_info_map[file_id] = filename
+                                                except Exception:
+                                                    file_info_map[file_id] = f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"
+                                            
+                                            citation_quotes.append({
+                                                'file_id': file_id,
+                                                'quote': quote_text or '',
+                                                'filename': file_info_map.get(file_id, f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"),
+                                                'start_index': start_idx,
+                                                'end_index': end_idx,
+                                                'has_quote': quote_text is not None
+                                            })
+            
+            # Fallback to items pattern if output pattern doesn't work
+            if not response_text and hasattr(response, 'items') and response.items:
+                for item in response.items:
+                    if hasattr(item, 'type') and item.type == 'message':
+                        if hasattr(item, 'role') and item.role == 'assistant':
+                            # Extract text content
+                            if hasattr(item, 'content') and item.content:
+                                for content in item.content:
+                                    if hasattr(content, 'type') and content.type == 'text':
+                                        if hasattr(content, 'text'):
+                                            response_text = content.text
+                                        elif hasattr(content, 'value'):
+                                            response_text = content.value
+                                        
+                                        # Extract citations from annotations
+                                        if hasattr(content, 'annotations'):
+                                            annotations = content.annotations
+                                            for annotation in annotations:
+                                                if hasattr(annotation, 'file_citation'):
+                                                    citation = annotation.file_citation
+                                                    file_id = getattr(citation, 'file_id', None)
+                                                    
+                                                    if file_id:
+                                                        unique_file_ids.add(file_id)
+                                                        
+                                                        # Extract quote text if available
+                                                        quote_text = getattr(citation, 'quote', None)
+                                                        
+                                                        # If quote is not directly available, try to extract from text using indices
+                                                        if not quote_text:
+                                                            start_idx = getattr(citation, 'start_index', None)
+                                                            end_idx = getattr(citation, 'end_index', None)
+                                                            if start_idx is not None and end_idx is not None:
+                                                                try:
+                                                                    quote_text = response_text[start_idx:end_idx] if end_idx <= len(response_text) else None
+                                                                except Exception:
+                                                                    quote_text = None
+                                                        
+                                                        # Fetch filename
+                                                        if file_id not in file_info_map:
+                                                            try:
+                                                                file_info = self.client.files.retrieve(file_id)
+                                                                filename = getattr(file_info, 'filename', None) or getattr(file_info, 'name', None)
+                                                                if filename:
+                                                                    file_info_map[file_id] = filename
+                                                            except Exception:
+                                                                file_info_map[file_id] = f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"
+                                                        
+                                                        citation_quotes.append({
+                                                            'file_id': file_id,
+                                                            'quote': quote_text or '',
+                                                            'filename': file_info_map.get(file_id, f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})"),
+                                                            'start_index': start_idx,
+                                                            'end_index': end_idx,
+                                                            'has_quote': quote_text is not None
+                                                        })
+            
+            if not response_text:
+                raise Exception("No response text generated from Responses API")
+            
+            # Build sources list from citations
+            sources = []
+            for file_id in unique_file_ids:
+                # Get all citation quotes for this file_id
+                file_citations = [c for c in citation_quotes if c['file_id'] == file_id]
+                filename = file_citations[0]['filename'] if file_citations else file_info_map.get(file_id, f"Document ({file_id[:8]}...)" if len(file_id) > 8 else f"Document ({file_id})")
+                
+                # Use the first quote as content/snippet, or empty string if no quote
+                content = file_citations[0]['quote'] if file_citations and file_citations[0].get('quote') else ''
+                
+                sources.append({
+                    'file_id': file_id,
+                    'content': content,
+                    'snippet': content,  # Use quote as snippet
+                    'filename': filename,
+                    'metadata': {
+                        'filename': filename,
+                        'is_citation_quote': bool(content),
+                        'citation_quotes': file_citations
+                    }
+                })
+            
+            # Set filtered count to 0 (Responses API handles filtering internally)
+            self.last_filtered_count = 0
+            
+            return response_text, sources
+            
+        except Exception as e:
+            error_msg = str(e)
+            self.last_error = error_msg  # Store error for debugging
+            
+            # Log API error
+            api_error_logger.error(f"Responses API (get_rag_response) failed: {error_msg} | Query: {user_query[:100]}...")
+            api_error_logger.error("Falling back to direct vector search + Chat Completions")
+            
+            # Always fallback on any error - Responses API might exist but not work correctly
+            # This handles cases where Responses API exists but fails for various reasons
+            self.last_api_used = "fallback_rag"
+            return self._get_rag_response_fallback(user_query, conversation_history, min_relevance_score)
+    
+    def _get_rag_response_fallback(self, user_query: str, conversation_history: List[Dict[str, str]], min_relevance_score: Optional[float] = None) -> tuple[str, List[Dict]]:
+        """
+        Fallback method when Responses API is not available.
+        Uses direct vector search + Chat Completions API.
         
         Args:
             user_query: The user's question or message
@@ -572,11 +906,12 @@ class OpenAIClient:
             min_relevance_score: Optional minimum relevance score threshold for filtering
             
         Returns:
-            Tuple of (response_text, sources_list) where sources_list contains:
-            [{"file_id": "...", "content": "...", "metadata": {...}}]
+            Tuple of (response_text, sources_list)
         """
-        # Step 1: Query vector store for relevant context using Assistants API
-        vector_results = self.query_vector_store(user_query)
+        # Track that we're using fallback method
+        self.last_api_used = "fallback_rag"
+        # Step 1: Query vector store for relevant context using direct search
+        vector_results = self.direct_vector_search(user_query, max_num_results=50)
         
         # Filter by relevance score if threshold provided
         if min_relevance_score is not None:
@@ -588,8 +923,9 @@ class OpenAIClient:
         # Step 2: Extract source file IDs from vector store results
         source_file_ids = []
         for result in vector_results:
-            file_ids = result.get('metadata', {}).get('file_ids', [])
-            source_file_ids.extend(file_ids)
+            file_id = result.get('file_id')
+            if file_id:
+                source_file_ids.append(file_id)
         
         # Remove duplicates while preserving order
         seen = set()
@@ -599,12 +935,22 @@ class OpenAIClient:
                 seen.add(file_id)
                 unique_file_ids.append(file_id)
         
-        # Step 3: Combine context from vector store results
+        # Step 3: Combine context from vector store results (limit to avoid token issues)
+        # Use only citation quotes if available, otherwise truncate content
         context_parts = []
-        for result in vector_results:
-            content = result.get('content', '')
-            if content:
-                context_parts.append(content)
+        for result in vector_results[:20]:  # Limit to top 20 to avoid token limits
+            # Prefer citation quotes, fallback to content
+            citation_quotes = result.get('citation_quotes', [])
+            if citation_quotes:
+                for quote in citation_quotes[:3]:  # Limit quotes per result
+                    if quote.get('quote'):
+                        context_parts.append(quote['quote'])
+            else:
+                content = result.get('content', '')
+                if content:
+                    # Truncate to first 500 chars to avoid token bloat
+                    truncated = content[:500] + "..." if len(content) > 500 else content
+                    context_parts.append(truncated)
         
         context = "\n\n".join(context_parts) if context_parts else None
         
@@ -661,8 +1007,10 @@ class OpenAIClient:
         try:
             # Use direct search if available
             results = self.direct_vector_search(query, max_num_results=max_results)
-        except Exception:
-            # Fallback to Assistants API method
+        except Exception as e:
+            # Fallback to Responses API method
+            error_msg = str(e)
+            api_error_logger.error(f"Direct vector search failed in get_sources_for_query, falling back to Responses API: {error_msg} | Query: {query[:100]}...")
             results = self.query_vector_store(query, top_k=max_results)
         
         # Format results for display (hide technical IDs, show readable content)
