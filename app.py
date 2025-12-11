@@ -317,8 +317,9 @@ elif st.session_state.current_page == "chat":
     for idx, message in enumerate(st.session_state.messages):
         with st.chat_message(message["role"]):
             # Format message with citations if it's an assistant message with sources
-            if message["role"] == "assistant" and idx + 1 in st.session_state.message_sources:
-                sources = st.session_state.message_sources[idx + 1]
+            # Sources are stored at the message's index (set before appending assistant message)
+            if message["role"] == "assistant" and idx in st.session_state.message_sources:
+                sources = st.session_state.message_sources[idx]
                 formatted_content, _ = format_response_with_citations(message["content"], sources)
                 st.markdown(formatted_content)
                 
