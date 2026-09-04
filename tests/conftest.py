@@ -112,11 +112,15 @@ class FakeClient:
     controls actually reach the client layer.
     """
 
-    def __init__(self, answer="Fake answer.", sources=None, results=None, error=None):
+    def __init__(self, answer="Fake answer.", sources=None, results=None, error=None,
+                 attribute_values=None):
         self.answer = answer
         self.sources = sources if sources is not None else []
         self.results = results if results is not None else []
         self.error = error
+        # Empty by default, which hides the filter UI -- matching an untagged
+        # corpus, the state the app is in before a backfill runs.
+        self.attribute_values = attribute_values or {}
 
         # Attributes app.py reads directly
         self.responses_api_available = True
@@ -130,22 +134,31 @@ class FakeClient:
         self.search_calls = []
         self.chunk_calls = []
 
-    def get_rag_response(self, user_query, conversation_history, min_relevance_score=None):
-        self.rag_calls.append(
-            {"query": user_query, "min_relevance_score": min_relevance_score}
-        )
+    def get_rag_response(self, user_query, conversation_history,
+                         min_relevance_score=None, filters=None):
+        self.rag_calls.append({
+            "query": user_query,
+            "min_relevance_score": min_relevance_score,
+            "filters": filters,
+        })
         if self.error:
             raise self.error
         self.last_threshold_applied = min_relevance_score or 0.0
         return self.answer, self.sources
 
-    def search_vectors(self, query, top_k=50, min_relevance_score=None):
-        self.search_calls.append(
-            {"query": query, "top_k": top_k, "min_relevance_score": min_relevance_score}
-        )
+    def search_vectors(self, query, top_k=50, min_relevance_score=None, filters=None):
+        self.search_calls.append({
+            "query": query,
+            "top_k": top_k,
+            "min_relevance_score": min_relevance_score,
+            "filters": filters,
+        })
         if self.error:
             raise self.error
         return self.results
+
+    def list_attribute_values(self, keys):
+        return {k: v for k, v in self.attribute_values.items() if k in keys}
 
     def ask_about_chunks(self, question, chunks):
         self.chunk_calls.append({"question": question, "chunks": chunks})

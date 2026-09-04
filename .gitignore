@@ -26,3 +26,6 @@ api_errors.log
 
 # Local-only audit (contains security findings; repo is public)
 AUDIT.md
+
+# Source documents for ingestion (client-confidential; repo is public)
+documents/

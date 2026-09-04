@@ -75,6 +75,82 @@ The app will open in your default web browser at `http://localhost:8501`.
 
 **Troubleshooting:** If you see an error about "unexpected keyword argument 'proxies'", it means Streamlit is using the system Python instead of your venv. Use `python -m streamlit run app.py` instead of just `streamlit run app.py` to ensure the correct Python environment is used.
 
+## Adding Documents
+
+Documents are uploaded to the vector store and tagged automatically. Tags are
+stored as OpenAI **file attributes**, which the search API filters on
+server-side, so filtered searches never retrieve non-matching documents.
+
+### Ingest a folder
+
+```bash
+# Always dry-run first: tags are computed and printed, nothing is stored.
+./venv/bin/python scripts/ingest_documents.py --folder ./documents --dry-run
+
+# Then one real file, to confirm attributes attach.
+./venv/bin/python scripts/ingest_documents.py --folder ./documents --limit 1
+
+./venv/bin/python scripts/ingest_documents.py --folder ./documents
+```
+
+Supported: `.pdf .doc .docx .pptx .txt .md .html .json` (512 MB / 5M tokens per
+file). Re-running is safe — already-ingested documents are skipped.
+
+### Tag documents already in the store
+
+```bash
+./venv/bin/python scripts/backfill_tags.py --dry-run
+./venv/bin/python scripts/backfill_tags.py --only-untagged
+```
+
+Nothing is re-uploaded or re-embedded: a vector store file's id is a Files API
+file id, so the model reads it in place and `vector_stores.files.update()`
+attaches the result.
+
+### How tagging works
+
+Each file is uploaded to the Files API **once**, then that same `file_id` is
+used twice — as an `input_file` for the tagging model, and as the file attached
+to the vector store. OpenAI extracts the text (and page images, for PDFs) on
+both paths, so there is no local PDF or DOCX parsing and no extra dependency.
+
+Tags come from `gpt-5.6-luna` with strict structured outputs against the schema
+in [document_tagger.py](document_tagger.py) — roughly **$0.01 per document**.
+
+| Attribute | Notes |
+|---|---|
+| `client`, `agency` | Free text |
+| `year` | Number, so `gte`/`lte` range filters are possible |
+| `doc_type`, `sector`, `primary_topic`, `secondary_topic`, `outcome` | Closed enums |
+| `content_sha256`, `source_filename` | Provenance and dedupe |
+
+**Why enums.** Filters compare with `eq`. Free-text categories drift — the
+model writes "Public Health" one day and "public health" the next — and the
+filter silently misses. `strict: true` structured outputs make drift impossible
+for the enum fields. Do not relax it.
+
+**Attributes cannot hold arrays** (max 16 keys, values `str`/`float`/`bool`,
+256 chars each). That is why topics are two single-valued keys rather than a
+list.
+
+### Known limitations
+
+- **Free-text `client` values drift.** The corpus currently contains both
+  `"California Department of Public Health"` and `"California Department of
+  Public Health, Office of Health Equity"` as separate clients, so filtering on
+  one will not match the other. Client cannot be an enum (the list is not known
+  in advance); normalizing these by hand via `vector_stores.files.update()` is
+  the practical fix.
+- **Backfilled files have no content hash.** Files uploaded with
+  `purpose="assistants"` cannot be downloaded, so `backfill_tags.py` cannot
+  hash them. `source_filename` is used as the dedupe key instead — a renamed
+  file could therefore be ingested twice.
+- **`outcome` is almost always `unknown`**, because RFP responses rarely state
+  whether the bid was won. Populating it means editing attributes directly.
+- **Single-value filters are hidden** in the sidebar, since a dropdown that
+  cannot narrow anything is noise.
+
+
 ## Testing
 
 Install the dev dependencies once:
@@ -86,7 +162,7 @@ Install the dev dependencies once:
 ### Automated tests (no network, no API key, no cost)
 
 ```bash
-./venv/bin/python -m pytest          # 50 tests, well under a second
+./venv/bin/python -m pytest          # 87 tests, well under a second
 ./venv/bin/python -m pytest -v       # per-test names
 ```
 
@@ -99,7 +175,8 @@ replaced by a `MagicMock`, and the front end is driven headlessly by
 |---|---|
 | `tests/test_config.py` | Config defaults, `validate()`, reasoning-effort validation |
 | `tests/test_openai_client.py` | Parameters sent to OpenAI, citation parsing, relevance filtering, response parsing |
-| `tests/test_frontend.py` | Chat and Research pages, sidebar controls, error handling, password gate |
+| `tests/test_document_tagger.py` | Tag schema, attribute limits, filter construction, dedupe |
+| `tests/test_frontend.py` | Chat and Research pages, filters, sidebar controls, error handling, password gate |
 
 Three tests are regressions for specific fixed bugs, and each has been
 confirmed to fail when its fix is reverted:
@@ -174,6 +251,7 @@ once at import and Streamlit does not re-import cached modules on rerun.
 ```
 ├── app.py                     # Streamlit UI: pages, nav, session state
 ├── openai_client.py           # All OpenAI I/O and response parsing
+├── document_tagger.py         # Tag schema, attribute coercion, filter building
 ├── config.py                  # Environment-variable configuration
 ├── logger.py                  # api_errors.log setup
 ├── utility.py                 # Password gate
@@ -185,8 +263,11 @@ once at import and Streamlit does not re-import cached modules on rerun.
 │   ├── conftest.py            # Fakes and shared fixtures
 │   ├── test_config.py
 │   ├── test_openai_client.py
+│   ├── test_document_tagger.py
 │   └── test_frontend.py       # Headless UI tests (AppTest)
 ├── scripts/
+│   ├── ingest_documents.py    # Upload + tag a folder of documents
+│   ├── backfill_tags.py       # Tag documents already in the store
 │   └── smoke_live_api.py      # Manual live API check (billable)
 ├── .github/workflows/test.yml # CI: runs pytest, needs no secrets
 ├── .env                       # Environment variables (create this, gitignored)
