@@ -1,0 +1,8 @@
+# Development/test dependencies. Install with:
+#   ./venv/bin/pip install -r requirements-dev.txt
+#
+# Runtime deps live in requirements.txt. Mocking uses stdlib unittest.mock,
+# so no pytest-mock is needed.
+-r requirements.txt
+
+pytest>=8.0.0

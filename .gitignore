@@ -21,3 +21,8 @@ query_log.jsonl
 api_errors.log
 .streamlit/
 .streamlit/secrets.toml
+# macOS
+.DS_Store
+
+# Local-only audit (contains security findings; repo is public)
+AUDIT.md
