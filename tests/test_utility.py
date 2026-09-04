@@ -261,3 +261,33 @@ def test_correct_password_still_works_below_threshold():
     at.text_input[0].set_value("correct-horse").run()
 
     assert [t.value for t in at.title] == ["Protected content"]
+
+
+def test_client_key_is_stable_when_ip_is_not_a_string(monkeypatch):
+    """CI caught this: st.context.ip_address returned a MagicMock, so every
+    attempt got a unique bucket key and per-client limiting did nothing.
+    Any non-string must collapse to one shared key."""
+    from unittest.mock import MagicMock
+
+    import utility
+
+    monkeypatch.setattr(utility.st, "context", MagicMock())
+
+    assert utility._client_key() == "unknown"
+    assert utility._client_key() == utility._client_key()
+
+
+def test_client_key_uses_a_real_ip(monkeypatch):
+    import utility
+    from conftest import ns
+
+    monkeypatch.setattr(utility.st, "context", ns(ip_address=" 203.0.113.7 "))
+    assert utility._client_key() == "203.0.113.7"
+
+
+def test_client_key_falls_back_when_ip_is_none(monkeypatch):
+    import utility
+    from conftest import ns
+
+    monkeypatch.setattr(utility.st, "context", ns(ip_address=None))
+    assert utility._client_key() == "unknown"
