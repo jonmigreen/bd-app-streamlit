@@ -31,6 +31,9 @@ def init_session_state():
         "research_results": [],
         "relevance_threshold": 0.55,
         "selected_snippets": [],
+        # Bumped on each search so snippet checkboxes get fresh widget keys
+        # and cannot carry selections over to an unrelated result set.
+        "search_generation": 0,
         "filters": {},
         "current_sources": [],
         "research_answer": None,  # Research mode answer
@@ -264,10 +267,18 @@ def chat_page():
 
                     # Debug info
                     client = st.session_state.openai_client
-                    if st.session_state.debug_mode and client.last_filtered_count > 0:
-                        st.info(
-                            f"🔍 Filtered {client.last_filtered_count} source(s) below threshold"
-                        )
+                    if st.session_state.debug_mode:
+                        if client.last_threshold_applied is not None:
+                            # file_search filters server-side, so it never
+                            # reports how many chunks it dropped.
+                            st.info(
+                                f"🔍 {len(sources)} source(s) returned at or above "
+                                f"relevance {client.last_threshold_applied:.2f}"
+                            )
+                        elif client.last_filtered_count > 0:
+                            st.info(
+                                f"🔍 Filtered {client.last_filtered_count} source(s) below threshold"
+                            )
 
                     # Display response
                     message_placeholder.markdown(response_text)
@@ -335,6 +346,7 @@ def research_page():
                             min_relevance_score=st.session_state.relevance_threshold,
                         )
                         st.session_state.selected_snippets = []
+                        st.session_state.search_generation += 1
                         st.session_state.research_answer = None
                         st.session_state.research_cited_sources = []
                     except Exception as e:
@@ -449,10 +461,12 @@ def research_page():
                 ):
                     for idx, result in items:
                         # Selection checkbox
+                        # Keyed per search generation and given no `value=`:
+                        # the widget's own state is the single source of truth,
+                        # so a new search starts from unchecked boxes.
                         selected = st.checkbox(
                             f"Select snippet {idx + 1}",
-                            value=idx in st.session_state.selected_snippets,
-                            key=f"snippet_{idx}",
+                            key=f"snippet_{st.session_state.search_generation}_{idx}",
                         )
 
                         if selected and idx not in st.session_state.selected_snippets:
@@ -504,11 +518,18 @@ def research_page():
 
 
 # Navigation setup
-pages = [
-    st.Page(about_page, title="About", icon="💡"),
-    st.Page(chat_page, title="Chat", icon="💬"),
-    st.Page(research_page, title="Research Mode", icon="🔍"),
-]
+def main():
+    """Build navigation and run the selected page."""
+    pages = [
+        st.Page(about_page, title="About", icon="💡"),
+        st.Page(chat_page, title="Chat", icon="💬"),
+        st.Page(research_page, title="Research Mode", icon="🔍"),
+    ]
+    st.navigation(pages).run()
 
-nav = st.navigation(pages)
-nav.run()
+
+# Streamlit runs the main script with __name__ == "__main__", so the app
+# behaves identically. Importing this module (as the tests do) skips the
+# nav run, letting each page function be rendered in isolation.
+if __name__ == "__main__":
+    main()
