@@ -90,6 +90,30 @@ def reset_rate_limits():
     _global_limiter._failures.clear()
 
 
+def _record_failed_attempt(client, now=None):
+    """Count a failure against the global limiter, and the per-client one
+    only when the client is actually distinguishable."""
+    _global_limiter.record_failure("all", now=now)
+    if client != "unknown":
+        _client_limiter.record_failure(client, now=now)
+
+
+def _lockout_seconds(client, now=None):
+    """Seconds this visitor must wait, 0 if not locked.
+
+    The per-client limiter is skipped for an unresolvable client. Behind a
+    proxy every visitor shares one key, so enforcing the low per-client
+    threshold there would let any handful of failures -- from any mix of
+    people -- lock out everyone, while the global backstop never binds. A
+    limiter keyed on a value identical for all users is not per-client at
+    all; it is a mislabelled global limiter with the wrong threshold.
+    """
+    wait = _global_limiter.remaining("all", now=now)
+    if client != "unknown":
+        wait = max(wait, _client_limiter.remaining(client, now=now))
+    return wait
+
+
 def _client_key():
     """Best-effort client identifier.
 
@@ -178,8 +202,7 @@ def check_password() -> bool:
             st.session_state.pop(_PASSWORD_KEY, None)
         else:
             st.session_state[_AUTHENTICATED_KEY] = False
-            _client_limiter.record_failure(client)
-            _global_limiter.record_failure("all")
+            _record_failed_attempt(client)
             # Failed logins previously left no trace anywhere.
             api_error_logger.error(f"Failed login attempt from client={client}")
             st.session_state.pop(_PASSWORD_KEY, None)
@@ -187,10 +210,7 @@ def check_password() -> bool:
     if st.session_state.get(_AUTHENTICATED_KEY, False):
         return True
 
-    wait = max(
-        _client_limiter.remaining(client),
-        _global_limiter.remaining("all"),
-    )
+    wait = _lockout_seconds(client)
     if wait > 0:
         # Render no input at all: there is nothing to submit while locked, so
         # guessing cannot continue. Refuse rather than sleep -- sleeping would
