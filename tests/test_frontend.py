@@ -8,10 +8,33 @@ Pages are rendered by importing app and calling the page function directly.
 AppTest cannot navigate st.navigation/st.Page apps, and app.py's main() guard
 makes the module importable without rendering the whole app.
 """
+import sys
+
 import pytest
 from streamlit.testing.v1 import AppTest
 
 from conftest import FakeClient, make_snippet
+
+
+@pytest.fixture(autouse=True)
+def clear_filter_options_cache():
+    """Reset the @st.cache_data on load_filter_options between tests.
+
+    AppTest runs scripts in this process, so the cache -- which takes no
+    arguments and therefore has a single entry -- would otherwise leak the
+    first test's filter options into every later test.
+    """
+    def _clear():
+        module = sys.modules.get("app")
+        if module is not None:
+            try:
+                module.load_filter_options.clear()
+            except Exception:
+                pass
+
+    _clear()
+    yield
+    _clear()
 
 
 def run_page(page_fn, fake, **session):
@@ -177,6 +200,151 @@ def test_config_error_is_reported_distinctly():
 
     assert not at.exception
     assert any("Configuration Error" in e.value for e in at.error)
+
+
+# ==========================================================================
+# Attribute filters
+# ==========================================================================
+
+TAGGED_CORPUS = {
+    "client": ["CDPH", "DCC"],
+    "year": [2023.0, 2024.0],
+    "doc_type": ["capabilities", "rfp_response"],
+    "outcome": ["lost", "won"],
+}
+
+
+def test_filter_ui_hidden_when_corpus_untagged():
+    """Before a backfill runs nothing is tagged; offering empty dropdowns
+    would imply filters that cannot work."""
+    fake = FakeClient(attribute_values={})
+    at = run_page("chat_page", fake)
+
+    labels = [s.label for s in at.selectbox]
+    assert not any("Client" in label for label in labels)
+
+
+def test_single_value_filters_are_hidden():
+    """Every document being an rfp_response means that dropdown can never
+    narrow anything -- showing it implies a filter that does nothing."""
+    fake = FakeClient(attribute_values={
+        "client": ["CDPH", "DCC"],
+        "doc_type": ["rfp_response"],
+        "outcome": ["unknown"],
+    })
+    at = run_page("chat_page", fake)
+
+    labels = [s.label for s in at.selectbox]
+    assert any("Client" in label for label in labels)
+    assert not any("Document Type" in label for label in labels)
+    assert not any("Outcome" in label for label in labels)
+
+
+def test_filter_ui_offers_values_present_in_corpus():
+    fake = FakeClient(attribute_values=TAGGED_CORPUS)
+    at = run_page("chat_page", fake)
+
+    client_box = next(s for s in at.selectbox if "Client" in s.label)
+    assert client_box.options == ["All", "CDPH", "DCC"]
+
+
+def test_year_rendered_without_float_suffix():
+    """Years are stored as floats for range filters; 2024.0 in a dropdown
+    looks broken."""
+    fake = FakeClient(attribute_values=TAGGED_CORPUS)
+    at = run_page("chat_page", fake)
+
+    year_box = next(s for s in at.selectbox if "Year" in s.label)
+    assert year_box.options == ["All", "2023", "2024"]
+
+
+def test_selected_filter_reaches_client_on_chat():
+    fake = FakeClient(attribute_values=TAGGED_CORPUS)
+    at = run_page("chat_page", fake)
+
+    next(s for s in at.selectbox if "Client" in s.label).set_value("CDPH").run()
+    at.chat_input[0].set_value("question").run()
+
+    assert fake.rag_calls[0]["filters"] == {"client": "CDPH"}
+
+
+def test_year_filter_passed_as_number():
+    """Sent as a float so gte/lte range filters remain possible."""
+    fake = FakeClient(attribute_values=TAGGED_CORPUS)
+    at = run_page("chat_page", fake)
+
+    next(s for s in at.selectbox if "Year" in s.label).set_value("2024").run()
+    at.chat_input[0].set_value("question").run()
+
+    assert fake.rag_calls[0]["filters"] == {"year": 2024.0}
+
+
+def test_multiple_filters_combined():
+    fake = FakeClient(attribute_values=TAGGED_CORPUS)
+    at = run_page("chat_page", fake)
+
+    next(s for s in at.selectbox if "Client" in s.label).set_value("DCC").run()
+    next(s for s in at.selectbox if "Outcome" in s.label).set_value("won").run()
+    at.chat_input[0].set_value("question").run()
+
+    assert fake.rag_calls[0]["filters"] == {"client": "DCC", "outcome": "won"}
+
+
+def test_no_selection_sends_empty_filters():
+    """'All' must mean unfiltered, not 'match nothing'."""
+    fake = FakeClient(attribute_values=TAGGED_CORPUS)
+    at = run_page("chat_page", fake)
+
+    at.chat_input[0].set_value("question").run()
+
+    assert fake.rag_calls[0]["filters"] == {}
+
+
+def test_filter_reaches_client_on_research():
+    fake = FakeClient(attribute_values=TAGGED_CORPUS, results=[make_snippet(0)])
+    at = run_page("research_page", fake)
+
+    next(s for s in at.selectbox if "Client" in s.label).set_value("CDPH").run()
+    at.text_input[0].set_value("query")
+    click(at, "Search").run()
+
+    assert fake.search_calls[0]["filters"] == {"client": "CDPH"}
+
+
+def test_source_tags_rendered_in_panel():
+    tagged_source = {
+        "filename": "cdph_rfp.pdf",
+        "content": "body",
+        "score": 0.9,
+        "metadata": {"client": "CDPH", "year": 2024.0, "doc_type": "rfp_response"},
+    }
+    fake = FakeClient(answer="A.", sources=[tagged_source])
+    at = run_page("chat_page", fake)
+
+    at.chat_input[0].set_value("question").run()
+
+    captions = " ".join(c.value for c in at.caption)
+    assert "CDPH" in captions
+    assert "2024" in captions and "2024.0" not in captions
+
+
+def test_placeholder_tag_values_not_displayed():
+    """'unknown'/'none'/'other' are schema fallbacks, not information."""
+    source = {
+        "filename": "doc.pdf",
+        "content": "body",
+        "score": 0.9,
+        "metadata": {"client": "unknown", "outcome": "unknown",
+                     "primary_topic": "none", "sector": "other"},
+    }
+    fake = FakeClient(answer="A.", sources=[source])
+    at = run_page("chat_page", fake)
+
+    at.chat_input[0].set_value("question").run()
+
+    captions = " ".join(c.value for c in at.caption)
+    assert "unknown" not in captions
+    assert "none" not in captions
 
 
 # ==========================================================================

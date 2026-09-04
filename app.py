@@ -56,9 +56,66 @@ def init_session_state():
 init_session_state()
 
 
+FILTER_KEYS = ("client", "year", "doc_type", "outcome")
+FILTER_LABELS = {
+    "client": "🏢 Client",
+    "year": "📅 Year",
+    "doc_type": "📄 Document Type",
+    "outcome": "🏆 Outcome",
+}
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_filter_options():
+    """Distinct tag values across the corpus, for the filter dropdowns.
+
+    Cached because it lists every file in the store. Returns {} when nothing
+    is tagged yet, which hides the filter UI entirely.
+    """
+    return st.session_state.openai_client.list_attribute_values(FILTER_KEYS)
+
+
+def render_filters():
+    """Filter controls, shown only when the corpus actually has tags."""
+    options = load_filter_options()
+    if not options:
+        return
+
+    with st.expander("🔎 Filters", expanded=any(st.session_state.filters.values())):
+        selected = {}
+        for key in FILTER_KEYS:
+            values = options.get(key)
+            # A dropdown offering a single value cannot narrow anything --
+            # e.g. every document is an rfp_response. Hide it as noise.
+            if not values or len(values) < 2:
+                continue
+            # Year is stored as a float; render it as a plain year.
+            display = ["All"] + [
+                str(int(v)) if key == "year" and isinstance(v, float) else str(v)
+                for v in values
+            ]
+            choice = st.selectbox(
+                FILTER_LABELS[key], display, key=f"filter_{key}"
+            )
+            if choice != "All":
+                selected[key] = float(choice) if key == "year" else choice
+
+        st.session_state.filters = selected
+
+        if selected:
+            st.caption(f"Filtering on {len(selected)} attribute(s)")
+            if st.button("Clear filters", use_container_width=True):
+                for key in FILTER_KEYS:
+                    st.session_state.pop(f"filter_{key}", None)
+                st.session_state.filters = {}
+                st.rerun()
+
+
 def render_sidebar():
     """Render sidebar settings that appear on all pages."""
     with st.sidebar:
+        render_filters()
+
         # Settings
         with st.expander("⚙️ Settings", expanded=False):
             st.info(f"**Model:** {Config.OPENAI_MODEL}")
@@ -112,6 +169,22 @@ def render_sidebar():
                 st.rerun()
 
 
+TAG_DISPLAY_KEYS = ("client", "year", "doc_type", "sector", "primary_topic", "outcome")
+
+
+def format_tags(metadata: Dict) -> str:
+    """Render a source's tags as a compact caption line."""
+    parts = []
+    for key in TAG_DISPLAY_KEYS:
+        value = metadata.get(key)
+        if value is None or value in ("", "unknown", "none", "other"):
+            continue
+        if key == "year" and isinstance(value, float):
+            value = int(value)
+        parts.append(f"{key.replace('_', ' ')}: **{value}**")
+    return " · ".join(parts)
+
+
 def display_source_expander(sources: List[Dict], title_prefix: str = ""):
     """Display sources with expandable full passages."""
     if not sources:
@@ -123,6 +196,11 @@ def display_source_expander(sources: List[Dict], title_prefix: str = ""):
             display_name = filename.split("/")[-1] if "/" in filename else filename
 
             st.markdown(f"**{num}. {display_name}**")
+
+            # Tags, so users can see why a document matched
+            tags = format_tags(source.get("metadata") or {})
+            if tags:
+                st.caption(tags)
 
             # Expandable full passage (from file_search results)
             full_content = source.get("content", "")
@@ -262,6 +340,7 @@ def chat_page():
                             user_query=prompt,
                             conversation_history=conversation_history,
                             min_relevance_score=st.session_state.relevance_threshold,
+                            filters=st.session_state.filters,
                         )
                     )
 
@@ -344,6 +423,7 @@ def research_page():
                             query=query,
                             top_k=50,
                             min_relevance_score=st.session_state.relevance_threshold,
+                            filters=st.session_state.filters,
                         )
                         st.session_state.selected_snippets = []
                         st.session_state.search_generation += 1

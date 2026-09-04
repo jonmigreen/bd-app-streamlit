@@ -4,6 +4,7 @@ from typing import List, Dict, Optional, Tuple
 from openai import OpenAI
 import requests
 from config import Config
+from document_tagger import build_filter
 from logger import api_error_logger
 
 
@@ -282,14 +283,18 @@ class OpenAIClient:
         Args:
             query: The search query string
             top_k: Number of results to return
-            filters: Optional metadata filters (client-side filtering)
+            filters: Optional attribute filters, e.g. {"client": "CDPH"}.
+                Applied server-side by the vector store, so non-matching
+                documents are never retrieved.
             min_relevance_score: Optional minimum relevance threshold
-            
+
         Returns:
             List of results: [{"filename": "...", "snippet": "...", "score": 0.89, ...}]
         """
         # Get raw results
-        results = self.direct_vector_search(query, max_num_results=top_k)
+        results = self.direct_vector_search(
+            query, max_num_results=top_k, filters=filters
+        )
         
         # Format results
         formatted = []
@@ -317,17 +322,10 @@ class OpenAIClient:
                 'content': content,
                 'metadata': result.get('metadata', {})
             })
-        
-        # Apply metadata filters (client-side)
-        if filters:
-            formatted = [
-                item for item in formatted
-                if all(
-                    not value or item.get('metadata', {}).get(key) == value
-                    for key, value in filters.items()
-                )
-            ]
-        
+
+        # Attribute filtering happens server-side in direct_vector_search;
+        # nothing to filter out here.
+
         # Apply relevance filtering
         if min_relevance_score is not None:
             formatted, filtered_count = self._filter_by_relevance(formatted, min_relevance_score)
@@ -338,34 +336,80 @@ class OpenAIClient:
         
         return formatted
     
-    def direct_vector_search(self, query: str, max_num_results: int = MAX_SEARCH_RESULTS) -> List[Dict]:
+    def list_attribute_values(self, keys: Tuple[str, ...]) -> Dict[str, List]:
+        """
+        Distinct values for the given attribute keys across the vector store.
+
+        Used to populate the sidebar filter dropdowns so they only ever offer
+        values that actually exist in the corpus.
+
+        Returns:
+            {key: sorted list of distinct values}. Keys with no values are
+            omitted, so a corpus with no tags yields an empty dict.
+        """
+        found: Dict[str, set] = {key: set() for key in keys}
+
+        try:
+            for vs_file in self.client.vector_stores.files.list(
+                vector_store_id=self.vector_store_id
+            ):
+                attributes = getattr(vs_file, 'attributes', None) or {}
+                for key in keys:
+                    value = attributes.get(key)
+                    if value is not None and value != '':
+                        found[key].add(value)
+        except Exception as e:
+            api_error_logger.error(f"Listing attribute values failed: {str(e)}")
+            return {}
+
+        return {
+            key: sorted(values, key=str)
+            for key, values in found.items() if values
+        }
+
+    def direct_vector_search(
+        self,
+        query: str,
+        max_num_results: int = MAX_SEARCH_RESULTS,
+        filters: Optional[Dict] = None
+    ) -> List[Dict]:
         """
         Search the vector store using the direct search API.
-        
+
         Args:
             query: The search query string
             max_num_results: Maximum number of results
-            
+            filters: Optional attribute filters as a {key: value} dict,
+                converted to the API's filter shape before sending
+
         Returns:
             List of search results with content, metadata, and scores
         """
+        attribute_filter = build_filter(filters)
+
         try:
             # Try SDK methods
             if hasattr(self.client, 'beta') and hasattr(self.client.beta, 'vector_stores'):
                 if hasattr(self.client.beta.vector_stores, 'search'):
-                    response = self.client.beta.vector_stores.search(
-                        vector_store_id=self.vector_store_id,
-                        query=query,
-                        max_num_results=max_num_results
-                    )
+                    kwargs = {
+                        'vector_store_id': self.vector_store_id,
+                        'query': query,
+                        'max_num_results': max_num_results,
+                    }
+                    if attribute_filter:
+                        kwargs['filters'] = attribute_filter
+                    response = self.client.beta.vector_stores.search(**kwargs)
                     return self._parse_search_response(response)
-            
+
             if hasattr(self.client, 'vector_stores') and hasattr(self.client.vector_stores, 'search'):
-                response = self.client.vector_stores.search(
-                    vector_store_id=self.vector_store_id,
-                    query=query,
-                    max_num_results=max_num_results
-                )
+                kwargs = {
+                    'vector_store_id': self.vector_store_id,
+                    'query': query,
+                    'max_num_results': max_num_results,
+                }
+                if attribute_filter:
+                    kwargs['filters'] = attribute_filter
+                response = self.client.vector_stores.search(**kwargs)
                 return self._parse_search_response(response)
             
             # Fallback to REST API
@@ -410,8 +454,13 @@ class OpenAIClient:
                 elif isinstance(item.content, str):
                     result['content'] = item.content
             
-            # Extract metadata
-            if hasattr(item, 'metadata') and isinstance(item.metadata, dict):
+            # File tags come back as `attributes`, not `metadata`. Reading
+            # `metadata` here meant the dict was always empty, which is why
+            # the old client-side filters silently matched everything.
+            attributes = getattr(item, 'attributes', None)
+            if isinstance(attributes, dict):
+                result['metadata'] = dict(attributes)
+            elif hasattr(item, 'metadata') and isinstance(item.metadata, dict):
                 result['metadata'] = item.metadata
             
             # Get filename
@@ -446,7 +495,7 @@ class OpenAIClient:
             for item in response_data.get('data', []):
                 result = {
                     'content': '',
-                    'metadata': item.get('metadata', {}),
+                    'metadata': item.get('attributes') or item.get('metadata', {}),
                     'score': item.get('score'),
                     'file_id': item.get('file_id') or item.get('id')
                 }
@@ -611,16 +660,18 @@ Sources:
         self, 
         user_query: str, 
         conversation_history: List[Dict[str, str]],
-        min_relevance_score: Optional[float] = None
+        min_relevance_score: Optional[float] = None,
+        filters: Optional[Dict] = None
     ) -> Tuple[str, List[Dict]]:
         """
         Get RAG-enhanced response using Responses API with file_search.
-        
+
         Args:
             user_query: The user's question
             conversation_history: Previous messages (not used with Responses API)
             min_relevance_score: Optional minimum relevance threshold
-            
+            filters: Optional attribute filters as a {key: value} dict
+
         Returns:
             Tuple of (response_text, sources_list)
         """
@@ -631,7 +682,7 @@ Sources:
         if self.responses_api_available:
             try:
                 return self._get_rag_response_via_responses_api(
-                    user_query, min_relevance_score
+                    user_query, min_relevance_score, filters
                 )
             except Exception as e:
                 self.last_error = str(e)
@@ -643,7 +694,8 @@ Sources:
     def _get_rag_response_via_responses_api(
         self,
         user_query: str,
-        min_relevance_score: Optional[float] = None
+        min_relevance_score: Optional[float] = None,
+        filters: Optional[Dict] = None
     ) -> Tuple[str, List[Dict]]:
         """Get RAG response using Responses API with file_search tool."""
         self.last_api_used = "responses_api"
@@ -662,6 +714,13 @@ Sources:
                 "score_threshold": score_threshold
             }
         }
+
+        # Attribute filters restrict retrieval to matching documents, for the
+        # same reason as the score threshold: never pay input tokens for
+        # chunks that would be discarded.
+        attribute_filter = build_filter(filters)
+        if attribute_filter:
+            tools_config["filters"] = attribute_filter
 
         response = self.client.responses.create(
             model=self.model,
