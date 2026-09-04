@@ -98,9 +98,15 @@ def _client_key():
     limiter is what actually bounds an attacker.
     """
     try:
-        return st.context.ip_address or "unknown"
+        ip = st.context.ip_address
     except Exception:
         return "unknown"
+    # Must be a real, stable string. Anything else -- None, or a test double
+    # that returns a fresh object each call -- would hand every attempt its
+    # own bucket and silently disable per-client limiting.
+    if isinstance(ip, str) and ip.strip():
+        return ip.strip()
+    return "unknown"
 
 
 def _format_wait(seconds):
