@@ -135,3 +135,129 @@ def test_already_authenticated_callback_is_a_noop():
     assert not at.exception
     assert at.session_state["password_correct"] is True
     assert [t.value for t in at.title] == ["Protected content"]
+
+
+# ==========================================================================
+# Rate limiting
+#
+# Streamlit's own docs say st.context.ip_address "should not be used for
+# security measures because it can easily be spoofed", so the per-client
+# bucket is only a first line. The global bucket is the part an attacker
+# cannot sidestep by rotating identity.
+# ==========================================================================
+
+from utility import RateLimiter, reset_rate_limits  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _clean_limiters():
+    reset_rate_limits()
+    yield
+    reset_rate_limits()
+
+
+def limiter(**kw):
+    defaults = dict(max_attempts=3, window_seconds=60,
+                    base_lockout=10, max_lockout=100)
+    defaults.update(kw)
+    return RateLimiter(**defaults)
+
+
+def test_no_lockout_before_threshold():
+    rl = limiter()
+    rl.record_failure("a", now=0)
+    rl.record_failure("a", now=1)
+    assert rl.remaining("a", now=2) == 0
+
+
+def test_lockout_triggers_at_threshold():
+    rl = limiter()
+    for i in range(3):
+        rl.record_failure("a", now=i)
+    assert rl.remaining("a", now=3) > 0
+
+
+def test_lockout_expires():
+    rl = limiter()
+    for i in range(3):
+        rl.record_failure("a", now=i)
+    assert rl.remaining("a", now=1000) == 0
+
+
+def test_lockout_grows_exponentially():
+    """Each failure past the threshold should cost more, so sustained
+    guessing becomes impractical rather than merely slow."""
+    rl = limiter()
+    for i in range(3):
+        rl.record_failure("a", now=i)
+    first = rl.remaining("a", now=3)
+
+    rl.record_failure("a", now=4)
+    second = rl.remaining("a", now=5)
+
+    assert second > first
+
+
+def test_lockout_is_capped():
+    rl = limiter(max_lockout=100)
+    for i in range(30):
+        rl.record_failure("a", now=i)
+    assert rl.remaining("a", now=31) <= 100
+
+
+def test_old_failures_fall_out_of_window():
+    """Two failures today and one next week is not an attack."""
+    rl = limiter()
+    rl.record_failure("a", now=0)
+    rl.record_failure("a", now=1)
+    rl.record_failure("a", now=10_000)
+    assert rl.remaining("a", now=10_001) == 0
+
+
+def test_buckets_are_independent():
+    rl = limiter()
+    for i in range(3):
+        rl.record_failure("a", now=i)
+    assert rl.remaining("b", now=4) == 0
+
+
+def test_success_resets_the_bucket():
+    rl = limiter()
+    rl.record_failure("a", now=0)
+    rl.record_failure("a", now=1)
+    rl.reset("a")
+    rl.record_failure("a", now=2)
+    assert rl.remaining("a", now=3) == 0
+
+
+# --- the gate, end to end -------------------------------------------------
+
+def test_repeated_wrong_passwords_lock_the_form():
+    at = gated()
+    for _ in range(6):
+        if not at.text_input:
+            break          # locked out; the field is gone
+        at.text_input[0].set_value("wrong").run()
+
+    assert not at.exception
+    blob = " ".join(e.value for e in at.error).lower()
+    assert "too many" in blob or "try again" in blob
+
+
+def test_lockout_hides_the_password_input():
+    """While locked there is nothing to submit, so guessing cannot continue."""
+    at = gated()
+    for _ in range(6):
+        if not at.text_input:
+            break          # locked out; the field is gone
+        at.text_input[0].set_value("wrong").run()
+
+    assert not at.text_input, "password field still accepting input while locked"
+
+
+def test_correct_password_still_works_below_threshold():
+    at = gated()
+    at.text_input[0].set_value("wrong").run()
+    at.text_input[0].set_value("correct-horse").run()
+
+    assert [t.value for t in at.title] == ["Protected content"]
