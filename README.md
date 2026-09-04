@@ -28,8 +28,8 @@ Create a `.env` file in the project root with the following variables:
 ```env
 OPENAI_API_KEY=your_openai_api_key_here
 OPENAI_VECTOR_STORE_ID=your_vector_store_id_here
-OPENAI_MODEL=gpt-4-turbo-preview
-OPENAI_TEMPERATURE=0.7
+OPENAI_MODEL=gpt-5.6-terra
+OPENAI_REASONING_EFFORT=low
 ```
 
 **Required:**
@@ -37,8 +37,23 @@ OPENAI_TEMPERATURE=0.7
 - `OPENAI_VECTOR_STORE_ID`: Your OpenAI vector store ID
 
 **Optional:**
-- `OPENAI_MODEL`: Model to use (default: `gpt-4-turbo-preview`)
-- `OPENAI_TEMPERATURE`: Temperature for responses (default: `0.7`)
+- `OPENAI_MODEL`: Model to use (default: `gpt-5.6-terra`)
+- `OPENAI_REASONING_EFFORT`: One of `none`, `low`, `medium`, `high`, `xhigh`,
+  `max` (default: `low`)
+
+> **Note on `OPENAI_REASONING_EFFORT`:** GPT-5.x models are reasoning models.
+> Reasoning tokens are billed as **output** tokens, so raising the effort
+> raises cost and latency. `low` is a good fit for retrieval-grounded
+> summarization; the model's default when unset would be `medium`.
+>
+> These models also **reject the `temperature` parameter** unless effort is
+> `none`, which is why `OPENAI_TEMPERATURE` no longer exists. If you switch
+> back to a non-reasoning model (e.g. `gpt-4.1`), you must also revert the
+> `reasoning_effort` arguments in `openai_client.py` — that model rejects them.
+
+**Deployment note:** on Streamlit Community Cloud there is no `.env` file. Set
+the same keys in the app's secrets; Streamlit exposes `secrets.toml` entries as
+environment variables, which is what `config.py` reads.
 
 ### 3. Run the Application
 
@@ -59,6 +74,72 @@ python -m streamlit run app.py
 The app will open in your default web browser at `http://localhost:8501`.
 
 **Troubleshooting:** If you see an error about "unexpected keyword argument 'proxies'", it means Streamlit is using the system Python instead of your venv. Use `python -m streamlit run app.py` instead of just `streamlit run app.py` to ensure the correct Python environment is used.
+
+## Testing
+
+Install the dev dependencies once:
+
+```bash
+./venv/bin/pip install -r requirements-dev.txt
+```
+
+### Automated tests (no network, no API key, no cost)
+
+```bash
+./venv/bin/python -m pytest          # 50 tests, well under a second
+./venv/bin/python -m pytest -v       # per-test names
+```
+
+The suite is hermetic. `openai_client.py` is tested with the OpenAI SDK
+replaced by a `MagicMock`, and the front end is driven headlessly by
+`streamlit.testing.v1.AppTest` with a `FakeClient` pre-seeded into
+`st.session_state` — so no API key is required and CI needs no secrets.
+
+| File | Covers |
+|---|---|
+| `tests/test_config.py` | Config defaults, `validate()`, reasoning-effort validation |
+| `tests/test_openai_client.py` | Parameters sent to OpenAI, citation parsing, relevance filtering, response parsing |
+| `tests/test_frontend.py` | Chat and Research pages, sidebar controls, error handling, password gate |
+
+Three tests are regressions for specific fixed bugs, and each has been
+confirmed to fail when its fix is reverted:
+
+- `test_responses_call_sends_score_threshold` — the relevance slider reaching `file_search`
+- `test_citation_12_does_not_also_match_source_1` — `"Source 1"` matching inside `"Source 10"`
+- `test_new_search_clears_snippet_selections` — stale checkboxes carrying across searches
+
+**Note on front-end tests:** `AppTest` cannot navigate apps built with
+`st.navigation`/`st.Page`, so tests import `app` and call the page function
+directly. This works because `app.py` guards its navigation behind
+`if __name__ == "__main__":` — keep that guard or the tests will double-render.
+
+### Live API smoke test (one real call, a few cents)
+
+The suite mocks the SDK, so it cannot detect the API rejecting a parameter.
+Only a real call can:
+
+```bash
+./venv/bin/python scripts/smoke_live_api.py
+```
+
+It reports the model echoed back, citation count, chunk scores versus the
+threshold, and token usage broken out by reasoning tokens. Run it after any
+model or parameter change. It is deliberately excluded from CI.
+
+### Manual testing in the browser
+
+```bash
+./run.sh        # http://localhost:8501
+```
+
+The real app against the real vector store — **each query costs money**. Use it
+for what automation cannot judge: answer quality, whether the model still emits
+`[Source N]` citations, and whether the relevance threshold returns a sensible
+number of sources against your documents.
+
+Restart the process after editing `.env`; `Config` reads environment variables
+once at import and Streamlit does not re-import cached modules on rerun.
+
 
 ## Usage
 
@@ -91,32 +172,44 @@ The app will open in your default web browser at `http://localhost:8501`.
 ## Project Structure
 
 ```
-├── app.py                 # Main Streamlit application
-├── openai_client.py       # OpenAI API integration (vector store + chat)
-├── config.py             # Configuration management
-├── requirements.txt       # Python dependencies
-├── .env                  # Environment variables (create this)
-├── .env.example          # Environment template
-└── README.md             # This file
+├── app.py                     # Streamlit UI: pages, nav, session state
+├── openai_client.py           # All OpenAI I/O and response parsing
+├── config.py                  # Environment-variable configuration
+├── logger.py                  # api_errors.log setup
+├── utility.py                 # Password gate
+├── run.sh                     # Launch helper (activates venv)
+├── requirements.txt           # Runtime dependencies
+├── requirements-dev.txt       # Test dependencies (pytest)
+├── pytest.ini                 # Test discovery config
+├── tests/
+│   ├── conftest.py            # Fakes and shared fixtures
+│   ├── test_config.py
+│   ├── test_openai_client.py
+│   └── test_frontend.py       # Headless UI tests (AppTest)
+├── scripts/
+│   └── smoke_live_api.py      # Manual live API check (billable)
+├── .github/workflows/test.yml # CI: runs pytest, needs no secrets
+├── .env                       # Environment variables (create this, gitignored)
+├── .streamlit/secrets.toml    # App password (gitignored)
+├── query_log.jsonl            # Query log (gitignored, not rotated)
+└── README.md                  # This file
 ```
 
 ## How It Works
 
-### Basic Chat Mode (Assistant-First)
-
-The app uses a dual-API approach for maximum transparency and control:
+### Basic Chat Mode
 
 1. **User Query**: User types a question in the chat interface
 
-2. **Parallel API Calls**:
-   - **Assistants API Call**: Uses OpenAI's Assistants API with `file_search` tool to:
-     - Query the vector store intelligently (with query rewriting and ranking)
-     - Retrieve relevant context automatically
-     - Generate a conversational answer
-   - **Direct Vector Search Call**: Simultaneously calls `vector-stores.search` API to:
-     - Get exact snippets from matched documents
-     - Retrieve relevance scores for each snippet
-     - Provide traceable source information
+2. **Single Responses API Call**: The app calls `client.responses.create()` with
+   the `file_search` tool pointed at the vector store. In one round trip this:
+   - Searches the vector store (with query rewriting and ranking)
+   - Filters low-scoring chunks server-side via
+     `ranking_options.score_threshold`, driven by the sidebar relevance slider
+   - Generates an answer grounded in the retrieved chunks
+   - Returns the chunks themselves, because the call passes
+     `include=["file_search_call.results"]` — this is what supplies the exact
+     snippet text and relevance scores shown in the Sources panel
 
 3. **Response Display**:
    - **Left Column**: Shows the AI-generated answer from Assistants API
@@ -249,19 +342,24 @@ This feature lets you control exactly which snippets are summarized:
 
 ### API Integration
 
-The app uses two complementary OpenAI APIs:
+The app uses two OpenAI APIs:
 
-1. **Assistants API** (`client.beta.assistants`):
-   - Used for conversational chat responses
-   - Provides intelligent query rewriting and ranking
-   - Handles file_search tool automatically
-   - Creates temporary assistants for RAG queries (can be optimized for production)
+1. **Responses API** (`client.responses.create`) — Chat mode:
+   - Runs the `file_search` tool against the vector store
+   - Provides query rewriting and ranking
+   - Applies `ranking_options.score_threshold` for server-side relevance filtering
+   - Returns retrieved chunks alongside the answer via
+     `include=["file_search_call.results"]`
 
-2. **Vector Store Search API** (`client.beta.vector_stores.search`):
-   - Used for direct document retrieval
+2. **Vector Store Search API** (`client.vector_stores.search`) — Research mode:
+   - Direct document retrieval with no generation step
    - Returns exact snippets with relevance scores
-   - Provides traceable source information
-   - Enables filtering and quality evaluation
+   - Relevance filtering is applied client-side here
+
+> **The Assistants API is not used.** It was deprecated after the Responses API
+> reached feature parity and **shut down on August 26, 2026**. Earlier versions
+> of this README described an Assistants-based architecture; that is no longer
+> accurate.
 
 ### Session State Management
 

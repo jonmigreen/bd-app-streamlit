@@ -10,8 +10,9 @@ from logger import api_error_logger
 # Constants
 MAX_SEARCH_RESULTS = 50
 MAX_CONTEXT_RESULTS = 20
-MAX_CONTENT_LENGTH = 500
+MAX_CONTENT_LENGTH = 4000
 CITATION_MARKER_PATTERN = r'【\d+:\d+†[^】]*】'
+SOURCE_CITATION_PATTERN = r'\[Source (\d+)\]'
 
 
 class OpenAIClient:
@@ -23,12 +24,16 @@ class OpenAIClient:
         self.client = OpenAI(api_key=Config.OPENAI_API_KEY)
         self.vector_store_id = Config.OPENAI_VECTOR_STORE_ID
         self.model = Config.OPENAI_MODEL
-        self.temperature = Config.OPENAI_TEMPERATURE
+        self.reasoning_effort = Config.OPENAI_REASONING_EFFORT
         
         # State tracking
         self.last_filtered_count = 0
         self.last_api_used = None
         self.last_error = None
+        # Threshold handed to file_search's server-side ranker. The API does
+        # not report how many chunks it dropped, so last_filtered_count stays
+        # 0 on the Responses path and is only meaningful on the fallback.
+        self.last_threshold_applied = None
         
         # File info cache to avoid repeated API calls
         self._file_info_cache: Dict[str, str] = {}
@@ -505,10 +510,12 @@ class OpenAIClient:
                 prepared_messages.append(msg)
         
         try:
+            # Chat Completions takes reasoning effort as a flat parameter;
+            # the Responses API takes it nested as reasoning={"effort": ...}.
             return self.client.chat.completions.create(
                 model=self.model,
                 messages=prepared_messages,
-                temperature=self.temperature,
+                reasoning_effort=self.reasoning_effort,
                 stream=stream
             )
         except Exception as e:
@@ -571,7 +578,7 @@ Sources:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                temperature=self.temperature
+                reasoning_effort=self.reasoning_effort
             )
             
             if not response.choices:
@@ -579,12 +586,16 @@ Sources:
             
             answer = response.choices[0].message.content
             
-            # Identify which sources were cited in the response
-            cited_sources = []
-            for i, chunk in enumerate(chunks, 1):
-                if f"[Source {i}]" in answer or f"Source {i}" in answer:
-                    cited_sources.append(chunk)
-            
+            # Identify which sources were cited in the response.
+            # Parse citation numbers rather than substring matching: a check
+            # for "Source 1" also matches inside "Source 10".
+            cited_nums = {
+                int(n) for n in re.findall(SOURCE_CITATION_PATTERN, answer or '')
+            }
+            cited_sources = [
+                chunk for i, chunk in enumerate(chunks, 1) if i in cited_nums
+            ]
+
             # If no explicit citations found, include all as potential sources
             if not cited_sources:
                 cited_sources = chunks
@@ -614,11 +625,14 @@ Sources:
             Tuple of (response_text, sources_list)
         """
         self.last_filtered_count = 0
-        
+        self.last_threshold_applied = None
+
         # Use Responses API if available
         if self.responses_api_available:
             try:
-                return self._get_rag_response_via_responses_api(user_query)
+                return self._get_rag_response_via_responses_api(
+                    user_query, min_relevance_score
+                )
             except Exception as e:
                 self.last_error = str(e)
                 api_error_logger.error(f"Responses API failed: {str(e)}, using fallback")
@@ -626,21 +640,35 @@ Sources:
         # Fallback to direct search + chat completion
         return self._get_rag_response_fallback(user_query, conversation_history, min_relevance_score)
     
-    def _get_rag_response_via_responses_api(self, user_query: str) -> Tuple[str, List[Dict]]:
+    def _get_rag_response_via_responses_api(
+        self,
+        user_query: str,
+        min_relevance_score: Optional[float] = None
+    ) -> Tuple[str, List[Dict]]:
         """Get RAG response using Responses API with file_search tool."""
         self.last_api_used = "responses_api"
-        
+
+        # Filter server-side via the ranker so low-scoring chunks never enter
+        # the context window, rather than paying input tokens to discard them.
+        score_threshold = min_relevance_score if min_relevance_score is not None else 0.0
+        self.last_threshold_applied = score_threshold
+
         tools_config = {
             "type": "file_search",
             "vector_store_ids": [self.vector_store_id],
-            "max_num_results": MAX_SEARCH_RESULTS
+            "max_num_results": MAX_SEARCH_RESULTS,
+            "ranking_options": {
+                "ranker": "auto",
+                "score_threshold": score_threshold
+            }
         }
-        
+
         response = self.client.responses.create(
             model=self.model,
             input=user_query,
             tools=[tools_config],
-            include=["file_search_call.results"]  # Get full chunk content
+            include=["file_search_call.results"],  # Get full chunk content
+            reasoning={"effort": self.reasoning_effort}
         )
         
         # Extract text and citations
