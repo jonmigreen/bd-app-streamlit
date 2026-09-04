@@ -232,27 +232,45 @@ def test_success_resets_the_bucket():
 
 # --- the gate, end to end -------------------------------------------------
 
-def test_repeated_wrong_passwords_lock_the_form():
-    at = gated()
-    for _ in range(6):
+@pytest.fixture
+def resolvable_client(monkeypatch):
+    """Give the visitor a real, distinct IP so per-client limiting applies."""
+    import utility
+    from conftest import ns
+    monkeypatch.setattr(utility.st, "context", ns(ip_address="203.0.113.7"))
+
+
+def _guess(at, times, password="wrong"):
+    for _ in range(times):
         if not at.text_input:
             break          # locked out; the field is gone
-        at.text_input[0].set_value("wrong").run()
+        at.text_input[0].set_value(password).run()
+
+
+def test_repeated_wrong_passwords_lock_the_form(resolvable_client):
+    at = gated()
+    _guess(at, 6)
 
     assert not at.exception
     blob = " ".join(e.value for e in at.error).lower()
     assert "too many" in blob or "try again" in blob
 
 
-def test_lockout_hides_the_password_input():
+def test_lockout_hides_the_password_input(resolvable_client):
     """While locked there is nothing to submit, so guessing cannot continue."""
     at = gated()
-    for _ in range(6):
-        if not at.text_input:
-            break          # locked out; the field is gone
-        at.text_input[0].set_value("wrong").run()
+    _guess(at, 6)
 
     assert not at.text_input, "password field still accepting input while locked"
+
+
+def test_shared_client_key_does_not_lock_out_early():
+    """The regression this guards: behind a proxy every visitor shares a key,
+    so a handful of failures must NOT lock out the whole team."""
+    at = gated()
+    _guess(at, 8)
+
+    assert at.text_input, "shared-key visitors locked out well below the global threshold"
 
 
 def test_correct_password_still_works_below_threshold():
@@ -291,3 +309,50 @@ def test_client_key_falls_back_when_ip_is_none(monkeypatch):
 
     monkeypatch.setattr(utility.st, "context", ns(ip_address=None))
     assert utility._client_key() == "unknown"
+
+
+# --- per-client limiting must not become a too-strict global limiter ------
+
+def test_unresolvable_client_is_not_rate_limited_per_client(monkeypatch):
+    """Behind Streamlit Cloud's proxy every visitor shares one key. Enforcing
+    the per-client threshold on that shared key would let any 5 failures --
+    from any mix of people -- lock out the whole team, while the real global
+    backstop (25) never binds."""
+    from unittest.mock import MagicMock
+
+    import utility
+
+    monkeypatch.setattr(utility.st, "context", MagicMock())
+    reset_rate_limits()
+
+    key = utility._client_key()
+    assert key == "unknown"
+
+    for i in range(10):
+        utility._record_failed_attempt(key, now=1000 + i)
+
+    assert utility._lockout_seconds(key, now=1010) == 0, (
+        "shared key should be governed by the global limiter, not per-client"
+    )
+
+
+def test_resolvable_clients_are_limited_independently(monkeypatch):
+    import utility
+
+    reset_rate_limits()
+    for i in range(6):
+        utility._record_failed_attempt("203.0.113.7", now=1000 + i)
+
+    assert utility._lockout_seconds("203.0.113.7", now=1006) > 0
+    assert utility._lockout_seconds("198.51.100.4", now=1006) == 0
+
+
+def test_global_backstop_still_applies_to_shared_key(monkeypatch):
+    """Unresolvable clients are still bounded -- just by the global limiter."""
+    import utility
+
+    reset_rate_limits()
+    for i in range(26):
+        utility._record_failed_attempt("unknown", now=1000 + i)
+
+    assert utility._lockout_seconds("unknown", now=1026) > 0
